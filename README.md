@@ -1,4 +1,4 @@
-# FrostDB
+# FrostDB (not production ready yet)
 
 FrostDB is a Windows-first, drop-in replacement for Redis — built from scratch in Go with zero POSIX dependencies.
 
@@ -287,22 +287,36 @@ redis-cli EXEC
 ## Redis test cases passing:
 
 ./runtest --host 127.0.0.1 --port 6379 --verbose --single unit/type/list-3
+
 ./runtest --host 127.0.0.1 --port 6379 --verbose --single unit/type/list-2
+
 ./runtest --host 127.0.0.1 --port 6379 --verbose --single unit/type/list
+
 ./runtest --host 127.0.0.1 --port 6379 --verbose --single unit/type/stream
+
 ./runtest --host 127.0.0.1 --port 6379 --verbose --single unit/type/string
+
 ./runtest --host 127.0.0.1 --port 6379 --verbose --single unit/sort
 
 ./runtest --host 127.0.0.1 --port 6379 --verbose --single unit/pubsub
+
 ./runtest --host 127.0.0.1 --port 6379 --verbose --single unit/scan
 
 ./runtest --host 127.0.0.1 --port 6379 --verbose --single unit/limits
+
 ./runtest --host 127.0.0.1 --port 6379 --verbose --single unit/wait
+
 ./runtest --host 127.0.0.1 --port 6379 --verbose --single unit/bitfield
+
 ./runtest --host 127.0.0.1 --port 6379 --verbose --single unit/bitops
+
 ./runtest --host 127.0.0.1 --port 6379 --verbose --single unit/type/incr
+
 ./runtest --host 127.0.0.1 --port 6379 --verbose --single unit/type/array
+
 ./runtest --host 127.0.0.1 --port 6379 --verbose --single unit/type/hash
+
 ./runtest --host 127.0.0.1 --port 6379 --verbose --single unit/type/set
+
 ./runtest --host 127.0.0.1 --port 6379 --verbose --single unit/type/zset
 
