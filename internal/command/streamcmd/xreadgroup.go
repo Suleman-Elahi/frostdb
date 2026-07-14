@@ -122,6 +122,16 @@ parseStreams:
 	ch, cleanup := ctx.Engine.Subscribe(streamKeys)
 	defer cleanup()
 
+	// Release the command lock before blocking.
+	if ctx.CmdMu != nil {
+		ctx.CmdMu.Unlock()
+	}
+	defer func() {
+		if ctx.CmdMu != nil {
+			ctx.CmdMu.Lock()
+		}
+	}()
+
 	if blockMs == 0 {
 		<-ch
 		return read()

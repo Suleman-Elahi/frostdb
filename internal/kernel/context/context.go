@@ -1,11 +1,12 @@
 package context
 
 import (
+	"net"
+	"sync"
 	"time"
-	
+
 	"frostdb/internal/engine/api"
 	"frostdb/internal/resp/types"
-	"net"
 )
 
 // Context holds per-connection state and gives access to the engine.
@@ -76,6 +77,11 @@ type Context struct {
 
 	// ClientID is a unique identifier assigned to this connection.
 	ClientID int
+
+	// CmdMu is a pointer to the global command serialization mutex.
+	// Blocking commands (BLPOP, BZPOPMIN, etc.) must Unlock() before
+	// waiting and Lock() after waking up to avoid deadlock.
+	CmdMu *sync.Mutex
 }
 
 // DBSelectorFunc switches the context to the given database index.

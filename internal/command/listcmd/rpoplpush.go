@@ -87,6 +87,16 @@ func (c BRPopLPushCommand) Execute(ctx *context.Context, args []types.Value) typ
 		timeoutCh = time.After(time.Duration(timeoutSecs * float64(time.Second)))
 	}
 
+	// Release the command lock before blocking.
+	if ctx.CmdMu != nil {
+		ctx.CmdMu.Unlock()
+	}
+	defer func() {
+		if ctx.CmdMu != nil {
+			ctx.CmdMu.Lock()
+		}
+	}()
+
 	for {
 		if v, sig := popRightPushLeft(ctx, source, dest, true); !v.IsNull {
 			signalSource = sig

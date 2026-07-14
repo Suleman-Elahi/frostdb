@@ -127,6 +127,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 		Conn:       conn,
 		Done:       cctx.Done(),
 		ClientID:   clientID,
+		CmdMu:      &registry.CmdMu,
 	}
 
 	generic.RegisterClient(ctx)
@@ -153,10 +154,10 @@ func (s *Server) handleConnection(conn net.Conn) {
 	p := parser.New(conn)
 	w := bufio.NewWriterSize(conn, writeBufferSize)
 
-	cmdCh := make(chan []types.Value)
+	cmdCh := make(chan []types.Value, 64) // buffered to decouple reader from executor
 	errCh := make(chan error, 1)
 
-	// Read loop
+	// Read loop — must exit when the connection context is cancelled.
 	go func() {
 		for {
 			val, err := p.Parse()
@@ -165,11 +166,16 @@ func (s *Server) handleConnection(conn net.Conn) {
 				errCh <- err
 				return
 			}
+			var cmd []types.Value
 			if val.Type == types.TypeArray {
-				cmdCh <- val.Array
-			} else {
-				// Send a nil slice to represent a format error
-				cmdCh <- nil
+				cmd = val.Array
+			}
+			// Use a select so the goroutine exits if the connection handler
+			// has already returned and cancelled the context.
+			select {
+			case cmdCh <- cmd:
+			case <-cctx.Done():
+				return
 			}
 		}
 	}()
@@ -196,6 +202,11 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 				ctx.LastCmd = strings.ToLower(cmdName)
 				generic.UpdateClientLastCmd(ctx, ctx.LastCmd)
+
+				// Acquire the global command lock. This serializes all
+				// in-memory mutations across connections, matching
+				// Redis's single-threaded execution model.
+				registry.CmdMu.Lock()
 
 				// Recover from panics in command handlers to keep the connection alive.
 				func() {
@@ -287,6 +298,9 @@ func (s *Server) handleConnection(conn net.Conn) {
 					}
 				}
 
+				// Release the command lock before I/O (encode/flush).
+				registry.CmdMu.Unlock()
+
 			} else if cmdArgs != nil {
 				result = types.NewError("ERR wrong number of arguments")
 			} else {
@@ -329,6 +343,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 							"error", err,
 						)
 					}
+					return
 				}
 			}
 

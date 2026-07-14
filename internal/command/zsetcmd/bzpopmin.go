@@ -83,6 +83,16 @@ func (c BZPopMinCommand) Execute(ctx *context.Context, args []types.Value) types
 		timeoutCh = time.After(time.Duration(timeoutSecs * float64(time.Second)))
 	}
 
+	// Release the command lock before blocking.
+	if ctx.CmdMu != nil {
+		ctx.CmdMu.Unlock()
+	}
+	defer func() {
+		if ctx.CmdMu != nil {
+			ctx.CmdMu.Lock()
+		}
+	}()
+
 	for {
 		if val := tryZPopMin(ctx, keys); !val.IsNull {
 			return val

@@ -87,7 +87,17 @@ func (c BPopCommand) Execute(ctx *context.Context, args []types.Value) types.Val
 		timeoutCh = time.After(time.Duration(timeoutSecs * float64(time.Second)))
 	}
 
-	// Wait loop
+	// Wait loop — release the command lock so other connections can
+	// execute LPUSH/RPUSH that will unblock us.
+	if ctx.CmdMu != nil {
+		ctx.CmdMu.Unlock()
+	}
+	defer func() {
+		if ctx.CmdMu != nil {
+			ctx.CmdMu.Lock()
+		}
+	}()
+
 	for {
 		// Double-check just in case something was pushed before we subscribed
 		if val := c.tryPop(ctx, keys, true); !val.IsNull {

@@ -2,13 +2,24 @@ package registry
 
 import (
 	"strings"
+	"sync"
 	"unsafe"
 
-		"frostdb/internal/command/generic"
+	"frostdb/internal/command/generic"
 	"frostdb/internal/kernel/context"
 	"frostdb/internal/resp/types"
 	"frostdb/internal/stats"
 )
+
+// CmdMu serializes command execution, matching Redis's single-threaded model.
+// Every command handler assumes exclusive access to in-memory data structures
+// (Hash.Dict, List nodes, Set/ZSet maps). Without this lock, concurrent
+// connections mutating the same key cause fatal "concurrent map writes".
+// Network I/O remains concurrent; only in-memory execution is serialized.
+//
+// Blocking commands (BLPOP, BZPOPMIN, etc.) must unlock before waiting and
+// re-lock after waking up. The server connection handler manages this.
+var CmdMu sync.Mutex
 
 type Command interface {
 	Execute(ctx *context.Context, args []types.Value) types.Value

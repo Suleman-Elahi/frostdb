@@ -114,6 +114,16 @@ func (c BLMPOPCommand) Execute(ctx *context.Context, args []types.Value) types.V
 		timeoutCh = time.After(time.Duration(timeoutSecs * float64(time.Second)))
 	}
 
+	// Release the command lock before blocking.
+	if ctx.CmdMu != nil {
+		ctx.CmdMu.Unlock()
+	}
+	defer func() {
+		if ctx.CmdMu != nil {
+			ctx.CmdMu.Lock()
+		}
+	}()
+
 	for {
 		if val := tryBLMPop(ctx, keys, popLeft, count, true); !val.IsNull {
 			return val

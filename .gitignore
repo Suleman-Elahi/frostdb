@@ -1,0 +1,16 @@
+# Binaries
+frost
+frostdb
+frostdb.exe
+frostdb-test
+
+# Local files / Debug scripts
+scratch.go
+rdb_debug.go
+
+# Data directories
+data/
+test_data/
+
+# Benchmark results and scripts
+benchmark/
