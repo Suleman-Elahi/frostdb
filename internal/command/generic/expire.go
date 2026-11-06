@@ -26,6 +26,7 @@ func (c ExpireCommand) Execute(ctx *context.Context, args []types.Value) types.V
 
 	obj, ok := ctx.Engine.Get(key)
 	if !ok {
+		ctx.SkipReplication = true
 		return types.NewInt(0)
 	}
 

@@ -3,9 +3,9 @@ package generic
 import (
 	"strings"
 
+	"frostdb/internal/acl"
 	"frostdb/internal/kernel/context"
 	"frostdb/internal/resp/types"
-	"frostdb/internal/acl"
 )
 
 // AclCommand implements ACL WHOAMI|CAT|LIST|HELP — stub for compatibility.
@@ -21,7 +21,11 @@ func (c AclCommand) Execute(ctx *context.Context, args []types.Value) types.Valu
 	sub := strings.ToUpper(string(args[0].Str))
 	switch sub {
 	case "WHOAMI":
-		return types.NewString("default")
+		username := ctx.Username
+		if username == "" {
+			username = "default"
+		}
+		return types.NewString(username)
 	case "CAT":
 		return types.RespEmptyArr
 	case "LIST":

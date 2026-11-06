@@ -35,10 +35,14 @@ func (c PUnsubscribeCommand) Execute(ctx *context.Context, args []types.Value) t
 			{Type: types.TypeBulkString, IsNull: true},
 			types.NewInt(int64(len(ctx.Subscriptions))),
 		})
+		if ctx.ExecutingMulti {
+			return reply
+		}
 		encoder.Encode(ctx.Conn, reply)
 		return types.Value{Type: types.TypeNoReply}
 	}
 
+	var lastReply types.Value
 	for _, pattern := range patternsToUnsubscribe {
 		if cleanup, exists := ctx.PatternSubs[pattern]; exists {
 			cleanup()
@@ -50,11 +54,18 @@ func (c PUnsubscribeCommand) Execute(ctx *context.Context, args []types.Value) t
 			types.NewString(pattern),
 			types.NewInt(int64(len(ctx.Subscriptions) + len(ctx.PatternSubs))),
 		})
-		encoder.Encode(ctx.Conn, reply)
+		lastReply = reply
+		if !ctx.ExecutingMulti || len(patternsToUnsubscribe) > 1 {
+			encoder.Encode(ctx.Conn, reply)
+		}
 	}
 
-	if len(ctx.PatternSubs) == 0 && len(ctx.Subscriptions) == 0 {
+	if len(ctx.PatternSubs) == 0 && len(ctx.Subscriptions) == 0 && len(ctx.ShardSubs) == 0 {
 		ctx.PubSubMode = false
+	}
+
+	if ctx.ExecutingMulti && len(patternsToUnsubscribe) == 1 {
+		return lastReply
 	}
 
 	return types.Value{Type: types.TypeNoReply}

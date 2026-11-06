@@ -31,8 +31,8 @@ func TestTimeCommand(t *testing.T) {
 
 func TestTouchCommand(t *testing.T) {
 	ctx := newTestCtx()
-	ctx.Engine.Set("a", &object.Object{Type: object.TypeString, Value: "1"})
-	ctx.Engine.Set("b", &object.Object{Type: object.TypeString, Value: "2"})
+	ctx.Engine.Set("a", &object.Object{Type: object.TypeString, Value: []byte("1")})
+	ctx.Engine.Set("b", &object.Object{Type: object.TypeString, Value: []byte("2")})
 
 	cmd := TouchCommand{}
 	result := cmd.Execute(ctx, []types.Value{
@@ -47,7 +47,7 @@ func TestTouchCommand(t *testing.T) {
 
 func TestCopyCommand(t *testing.T) {
 	ctx := newTestCtx()
-	ctx.Engine.Set("src", &object.Object{Type: object.TypeString, Value: "hello"})
+	ctx.Engine.Set("src", &object.Object{Type: object.TypeString, Value: []byte("hello")})
 
 	cmd := CopyCommand{}
 
@@ -61,7 +61,7 @@ func TestCopyCommand(t *testing.T) {
 	}
 
 	obj, ok := ctx.Engine.Get("dst")
-	if !ok || obj.Value.(string) != "hello" {
+	if !ok || string(obj.Value.([]byte)) != "hello" {
 		t.Fatalf("copy failed")
 	}
 
@@ -75,7 +75,7 @@ func TestCopyCommand(t *testing.T) {
 	}
 
 	// Copy with REPLACE should succeed
-	ctx.Engine.Set("src", &object.Object{Type: object.TypeString, Value: "world"})
+	ctx.Engine.Set("src", &object.Object{Type: object.TypeString, Value: []byte("world")})
 	result = cmd.Execute(ctx, []types.Value{
 		{Type: types.TypeBulkString, Str: []byte("src")},
 		{Type: types.TypeBulkString, Str: []byte("dst")},
@@ -85,7 +85,7 @@ func TestCopyCommand(t *testing.T) {
 		t.Fatalf("expected 1 with REPLACE, got %d", result.Num)
 	}
 	obj, _ = ctx.Engine.Get("dst")
-	if obj.Value.(string) != "world" {
+	if string(obj.Value.([]byte)) != "world" {
 		t.Fatalf("REPLACE copy failed")
 	}
 }
@@ -104,7 +104,7 @@ func TestWaitCommand(t *testing.T) {
 
 func TestObjectRefCount(t *testing.T) {
 	ctx := newTestCtx()
-	ctx.Engine.Set("mykey", &object.Object{Type: object.TypeString, Value: "val"})
+	ctx.Engine.Set("mykey", &object.Object{Type: object.TypeString, Value: []byte("val")})
 
 	cmd := ObjectCommand{}
 	result := cmd.Execute(ctx, []types.Value{

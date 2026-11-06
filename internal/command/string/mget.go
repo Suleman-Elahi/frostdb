@@ -1,6 +1,7 @@
 package str
 
 import (
+	"frostdb/internal/engine/object"
 	"frostdb/internal/kernel/context"
 	"frostdb/internal/resp/types"
 )
@@ -22,12 +23,12 @@ func (c MGetCommand) Execute(ctx *context.Context, args []types.Value) types.Val
 			result[i] = types.RespNil
 			continue
 		}
-		strVal, isStr := obj.Value.(string)
+		strVal, isStr := object.StringBytes(obj)
 		if !isStr {
 			result[i] = types.RespNil
 			continue
 		}
-		result[i] = types.NewString(strVal)
+		result[i] = types.NewBytes(strVal)
 	}
 	return types.NewArray(result)
 }

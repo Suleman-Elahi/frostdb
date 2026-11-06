@@ -2,6 +2,7 @@ package tx
 
 import (
 	"frostdb/internal/command/registry"
+	"frostdb/internal/engine/api"
 	"frostdb/internal/kernel/context"
 	"frostdb/internal/resp/types"
 )
@@ -55,12 +56,20 @@ func (c ExecCommand) Execute(ctx *context.Context, args []types.Value) types.Val
 	// Propagate EXEC to replicas
 	ctx.Engine.PropagateToReplicas([][]byte{[]byte("EXEC")})
 
+	if ctx.UnlockKeys != nil {
+		ctx.UnlockKeys()
+	}
+
 	// Flush deferred signals: wake blocked clients now that the
 	// transaction has fully applied (including expiry, deletes, etc).
-	signals := ctx.DeferredSignals
-	ctx.DeferredSignals = nil
-	for _, key := range signals {
-		ctx.Engine.SignalKey(key)
+	if signals := ctx.TakeSignals(); len(signals) > 0 {
+		if be, ok := ctx.Engine.(api.BlockingEngine); ok {
+			be.FlushSignals(signals)
+		} else {
+			for _, key := range signals {
+				ctx.Engine.SignalKey(key)
+			}
+		}
 	}
 
 	return types.NewArray(results)

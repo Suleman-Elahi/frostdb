@@ -2,15 +2,17 @@
 frost
 frostdb
 frostdb.exe
+frost.exe
 frostdb-test
 
 # Local files / Debug scripts
 scratch.go
 rdb_debug.go
-
+frostdb_flow_spec.txt
+frostdb_improvements.txt
 # Data directories
 data/
 test_data/
-
+redis/
 # Benchmark results and scripts
 benchmark/

@@ -39,7 +39,7 @@ func ExpireIfNeeded(ctx *context.Context, key string, h *object.Hash, fields []s
 	// Redis emits `hexpired` for commands that surface lazy field expiry.
 	if notifyHexpired {
 		ctx.Engine.NotifyKeyEvent(ctx.DB, uint32(keyevent.FlagHash), "hexpired", key)
-		ctx.Engine.NotifySubkey(ctx.DB, uint32(keyevent.FlagHash), "hexpired", key, fields)
+		ctx.Engine.NotifySubkey(ctx.DB, uint32(keyevent.FlagHash), "hexpired", key, expiredFields)
 	}
 	if hashBecameEmpty && notifyDel {
 		ctx.Engine.Del(key)

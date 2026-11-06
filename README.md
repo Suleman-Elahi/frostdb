@@ -41,17 +41,42 @@ FrostDB takes the opposite approach:
 
 ### Persistence
 
-Forkless write-ahead log with checkpoint support:
+FrostDB uses a forkless, CRC32-checked write-ahead log (WAL) plus periodic checkpoints. Recovery loads the latest checkpoint and replays the later WAL frames; an incomplete final frame from an interrupted write is ignored after all earlier checksum-verified frames are recovered. WAL segments rotate automatically at 64 MiB.
 
-```
-write → WAL append → memory apply
-recovery: checkpoint + WAL replay
+**Current write boundary:** a command handler updates memory first, then the dispatcher appends its successful deterministic or canonical WAL frame. This is intentionally documented because it is not log-before-apply atomic: if that first synchronous append fails, the client receives `ERR persistence failure` after the in-memory mutation may already have occurred. With the default policy, later writes are rejected while the WAL remains unhealthy.
+
+#### Durability and failure policy
+
+`appendfsync` controls flush behavior (default: `everysec`):
+
+- `always` — flush and fsync after every accepted WAL frame; this is the only per-command durable mode.
+- `everysec` — fsync pending frames about once per second; a power loss can lose roughly the most recent second of accepted writes.
+- `no` — defer to operating-system writeback during normal operation; a controlled shutdown still performs a final sync, but an unclean shutdown can lose more data.
+
+`wal-error-policy` controls write admission after WAL I/O fails (default: `stop-writes`):
+
+- `stop-writes` — reject subsequent mutations with `MISCONF` until WAL health recovers.
+- `continue` — retain availability and allow writes despite unhealthy persistence; use only when the resulting durability risk is acceptable.
+
+Configure either setting with CLI flags, environment variables, or a FrostDB config file:
+
+```bash
+./frost --appendfsync always --wal-error-policy stop-writes
+FROST_APPEND_FSYNC=everysec FROST_WAL_ERROR_POLICY=stop-writes ./frost
 ```
 
-- CRC32 checksummed WAL entries
-- Automatic WAL file rotation at 64MB
-- Periodic full checkpoints (configurable interval)
-- Recovery loads latest checkpoint then replays WAL on top
+```conf
+appendfsync everysec
+wal-error-policy stop-writes
+```
+
+Use `INFO Persistence` to monitor `frostdb_wal_fsync_policy`, `frostdb_wal_error_policy`, `frostdb_wal_write_admission`, WAL last-sync/failure/error fields, and checkpoint in-progress, result, count, and error fields.
+
+#### Replay compatibility
+
+WAL persistence is deliberately fail-closed for mutations without proven deterministic replay: those commands return an error while WAL persistence is enabled instead of acknowledging a write that a crash could lose. Supported replay covers the common string, expiry, list, set, sorted-set, hash, stream, rename, and flush paths, including canonical frames for random `SPOP` removals and empty sorted-set pops. Absolute TTL forms are preserved across restart.
+
+Some mutating command families remain unavailable with WAL enabled until their snapshot and replay semantics are completed—for example scripting/functions, bit and array mutations, copy/restore/sort, advanced stream mutations, and hash-field TTL operations. Existing WAL files produced by older FrostDB builds that logged raw `SPOP` frames cannot be made deterministic retroactively; take a checkpoint or migrate to a fresh WAL before relying on this version's canonical `SREM`/`DEL` frames.
 
 ### RDB Import / Export
 
@@ -202,13 +227,28 @@ go test ./...
 
 ## Benchmarks
 
-Run benchmarks with:
+Run the command dispatch benchmarks with:
 
 ```bash
-go test -bench . -benchmem ./bench
+go test -bench . -benchmem ./internal/command/registry
 ```
 
-Results on Intel Core i5 @ 2.50GHz, Windows, 4 cores (after zero-allocation pipeline overhaul):
+### Verified on this development environment
+
+Measured directly via `go test -bench . -benchmem` on Intel Core i5-6500T @ 2.50GHz, Linux, 4 cores, exercising the full `registry.Dispatch` path (parsing → ACL → striped key locking → command execution):
+
+| Benchmark | ns/op | allocs/op |
+|-----------|-------|-----------|
+| GET | 463 | 3 |
+| SET | 1,010 | 11 |
+| GET (parallel) | 259 | 3 |
+| SET (parallel) | 1,143 | 11 |
+
+These reflect a round of allocation-focused fixes: removing dead command-serialization code, ACL fast paths for the default (unrestricted) user, lazily allocating the striped-lock release/reacquire closures only for commands that actually block (BLPOP, XREAD, etc.), and zero-allocation single/two-key lock paths. Before these changes, GET was 12 allocs/op (869 ns/op) and SET was 20 allocs/op (1,451 ns/op) on the same machine — a 75% and 45% allocation reduction respectively.
+
+### Historical reference (Windows)
+
+The table below predates the environment above and was measured on Intel Core i5 @ 2.50GHz, Windows, 4 cores. It has not been re-verified on Linux and is kept for historical comparison only:
 
 | Benchmark | ops/sec | ns/op | allocs/op |
 |-----------|---------|-------|-----------|
@@ -223,11 +263,13 @@ Results on Intel Core i5 @ 2.50GHz, Windows, 4 cores (after zero-allocation pipe
 | Stream consumer (XADD+XREADGROUP+XACK) | ~281,041 | 4,085 | 50 |
 
 ### Performance Architecture
-- **Zero-Alloc Hot Paths**: Pre-allocated RESP types, `unsafe.String` casting, and inline FNV-1a hashing eliminate garbage collection pauses on hot keys.
+- **Zero-Alloc Hot Paths**: Pre-allocated RESP types, `unsafe.String` casting, and inline FNV-1a hashing eliminate garbage collection pauses on hot keys. FNV-1a was benchmarked against Go's runtime `hash/maphash` for typical short Redis keys and kept — the AES-accelerated runtime hash is only faster on long keys (>~40 bytes), not the common case.
+- **Fast-Path Key Locking**: Single-key commands (GET, SET, INCR, ...) and two-key commands (RENAME, LMOVE, SMOVE, ...) resolve and lock striped key slots without allocating a slice or map; only commands capable of releasing/reacquiring locks mid-execution (BLPOP, XREAD, DEBUG, ...) pay for the lock-callback closures.
 - **Data Structure Pooling**: `sync.Pool` extensively used for `ListNode`, `SkiplistNode`, and `WAL` byte buffers.
 - **Radix-like BTree Streams**: Streams are internally backed by `btree.BTreeG` blocks of packed arrays (Listpacks) combined with zero-alloc `StreamID` structs. This reduces pointers by a factor of 100x and avoids massive GC pauses when scanning millions of stream entries.
 - **O(1) Stream Consumers**: Consumers track precise byte offsets and `StreamID` structs rather than performing O(N) string-parsing scans.
 - **Forkless Persistence**: Zero-overhead dense binary WAL serialization.
+
 
 ## Ecosystem Compatibility
 - **redis-py**: Fully supports connecting, handshaking (`HELLO 3`), and communicating with Python's official Redis client.

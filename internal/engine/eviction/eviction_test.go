@@ -79,10 +79,10 @@ func TestEvictorNoEviction(t *testing.T) {
 		Policy:     PolicyNoEviction,
 		MaxSamples: 5,
 	}
-	ev := NewEvictor(shards, cfg)
+	ev := NewEvictor([][256]*shard.Shard{shards}, cfg)
 
 	// Add some data
-	shards[0].Set("key1", &object.Object{Type: object.TypeString, Value: "hello"})
+	shards[0].Set("key1", &object.Object{Type: object.TypeString, Value: []byte("hello")})
 	ev.TrackAlloc(2048) // exceed limit
 
 	// Should report OOM
@@ -104,7 +104,7 @@ func TestEvictorLRU(t *testing.T) {
 		Policy:     PolicyAllKeysLRU,
 		MaxSamples: 256, // sample every shard
 	}
-	ev := NewEvictor(shards, cfg)
+	ev := NewEvictor([][256]*shard.Shard{shards}, cfg)
 
 	// Add keys across all shards with stale access times
 	for i := 0; i < 256; i++ {
@@ -131,16 +131,16 @@ func TestEvictorVolatileTTL(t *testing.T) {
 		Policy:     PolicyVolatileTTL,
 		MaxSamples: 256,
 	}
-	ev := NewEvictor(shards, cfg)
+	ev := NewEvictor([][256]*shard.Shard{shards}, cfg)
 
 	// Add volatile keys with a future TTL across many shards
 	for i := 0; i < 100; i++ {
 		shards[i].Set("expires-soon", &object.Object{
-			Type: object.TypeString, Value: "val",
+			Type: object.TypeString, Value: []byte("val"),
 			ExpireAt: 9999999999999, // far future
 		})
 	}
-	shards[200].Set("persistent", &object.Object{Type: object.TypeString, Value: "val"})
+	shards[200].Set("persistent", &object.Object{Type: object.TypeString, Value: []byte("val")})
 
 	ev.TrackAlloc(1000)
 
@@ -163,7 +163,7 @@ func TestEvictorLFU(t *testing.T) {
 		LFULogFactor: 10,
 		LFUDecayTime: 1,
 	}
-	ev := NewEvictor(shards, cfg)
+	ev := NewEvictor([][256]*shard.Shard{shards}, cfg)
 
 	// Add keys with different frequencies across many shards
 	for i := 0; i < 200; i++ {

@@ -51,6 +51,7 @@ func MemoryProfile(rdbFilename string, csvFilename string, options ...interface{
 		if expiration == nil {
 			return ""
 		}
+		
 		return expiration.Format(time.RFC3339)
 	}
 	return dec.Parse(func(object model.RedisObject) bool {

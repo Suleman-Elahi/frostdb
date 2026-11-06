@@ -43,6 +43,10 @@ func NewString(s string) Value {
 	return Value{Type: TypeBulkString, Str: []byte(s)}
 }
 
+func NewBytes(b []byte) Value {
+	return Value{Type: TypeBulkString, Str: b}
+}
+
 func NewSimpleString(s string) Value {
 	return Value{Type: TypeSimpleString, Str: []byte(s)}
 }

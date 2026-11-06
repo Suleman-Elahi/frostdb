@@ -62,10 +62,10 @@ func (u *User) Authenticate(password string) bool {
 }
 
 func (u *User) CanExecute(cmd string) bool {
-	cmd = strings.ToLower(cmd)
-	if u.AllCommands {
+	if u.AllCommands || u.Categories["all"] {
 		return true
 	}
+	cmd = strings.ToLower(cmd)
 	if u.Commands[cmd] {
 		return true
 	}

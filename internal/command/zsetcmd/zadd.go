@@ -155,11 +155,7 @@ parseScores:
 	}
 
 	if changed > 0 || added > 0 {
-		if ctx.ExecutingMulti {
-			ctx.DeferredSignals = append(ctx.DeferredSignals, key)
-		} else {
-			ctx.Engine.SignalKey(key)
-		}
+		ctx.SignalKey(key)
 	}
 
 	if flagCH {
@@ -210,11 +206,7 @@ func (c ZAddCommand) zaddIncr(ctx *context.Context, key string, increment float6
 				Value:    zset,
 			})
 		}
-		if ctx.ExecutingMulti {
-			ctx.DeferredSignals = append(ctx.DeferredSignals, key)
-		} else {
-			ctx.Engine.SignalKey(key)
-		}
+		ctx.SignalKey(key)
 		return types.NewString(formatScore(newScore))
 	}
 
@@ -232,11 +224,7 @@ func (c ZAddCommand) zaddIncr(ctx *context.Context, key string, increment float6
 		Encoding: object.EncodingRaw,
 		Value:    zset,
 	})
-	if ctx.ExecutingMulti {
-		ctx.DeferredSignals = append(ctx.DeferredSignals, key)
-	} else {
-		ctx.Engine.SignalKey(key)
-	}
+	ctx.SignalKey(key)
 	return types.NewString(formatScore(newScore))
 }
 

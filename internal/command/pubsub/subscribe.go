@@ -15,6 +15,9 @@ func (c SubscribeCommand) Execute(ctx *context.Context, args []types.Value) type
 	if len(args) < 1 {
 		return types.NewError("ERR wrong number of arguments for 'subscribe' command")
 	}
+	if checkPubSubOOM(ctx, "SUBSCRIBE", args) {
+		return types.NewError("OOM command not allowed when used memory > 'maxmemory'.")
+	}
 
 	if ctx.Subscriptions == nil {
 		ctx.Subscriptions = make(map[string]func())
@@ -24,6 +27,7 @@ func (c SubscribeCommand) Execute(ctx *context.Context, args []types.Value) type
 	}
 	ctx.PubSubMode = true
 
+	var lastConfirm types.Value
 	for _, arg := range args {
 		channel := string(arg.Str)
 		
@@ -40,7 +44,14 @@ func (c SubscribeCommand) Execute(ctx *context.Context, args []types.Value) type
 			types.NewString(channel),
 			types.NewInt(int64(len(ctx.Subscriptions) + len(ctx.PatternSubs))),
 		})
-		encoder.Encode(ctx.Conn, confirm)
+		lastConfirm = confirm
+		if !ctx.ExecutingMulti || len(args) > 1 {
+			encoder.Encode(ctx.Conn, confirm)
+		}
+	}
+
+	if ctx.ExecutingMulti && len(args) == 1 {
+		return lastConfirm
 	}
 
 	// Return NoReply since we already wrote responses directly

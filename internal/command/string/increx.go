@@ -75,7 +75,7 @@ func (c IncrExCommand) Execute(ctx *context.Context, args []types.Value) types.V
 		if obj.Type != object.TypeString {
 			return types.NewError("WRONGTYPE Operation against a key holding the wrong kind of value")
 		}
-		strVal := obj.Value.(string)
+		strVal := string(obj.Value.([]byte))
 		if isFloat {
 			var err error
 			currentF64, err = strconv.ParseFloat(strVal, 64)

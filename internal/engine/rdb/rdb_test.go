@@ -31,8 +31,8 @@ func findKey(shards [256]*shard.Shard, key string) *object.Object {
 func TestExportImportRoundTrip(t *testing.T) {
 	shards := newShards()
 
-	shards[0].Set("str-key", &object.Object{Type: object.TypeString, Value: "hello world"})
-	shards[0].Set("str-ttl", &object.Object{Type: object.TypeString, Value: "expires", ExpireAt: 9999999999999})
+	shards[0].Set("str-key", &object.Object{Type: object.TypeString, Value: []byte("hello world")})
+	shards[0].Set("str-ttl", &object.Object{Type: object.TypeString, Value: []byte("expires"), ExpireAt: 9999999999999})
 
 	list := object.NewList()
 	list.PushBack([]byte("a"))
@@ -89,7 +89,7 @@ func TestExportImportRoundTrip(t *testing.T) {
 	if strObj == nil {
 		t.Fatal("str-key not found after import")
 	}
-	if strObj.Value.(string) != "hello world" {
+	if string(strObj.Value.([]byte)) != "hello world" {
 		t.Fatalf("str-key value mismatch: %v", strObj.Value)
 	}
 

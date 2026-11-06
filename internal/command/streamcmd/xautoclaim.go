@@ -4,6 +4,7 @@ import (
 	"strconv"
 	"strings"
 
+	"frostdb/internal/engine/keyevent"
 	"frostdb/internal/engine/object"
 	"frostdb/internal/kernel/context"
 	"frostdb/internal/resp/types"
@@ -63,7 +64,11 @@ func (c XAutoClaimCommand) Execute(ctx *context.Context, args []types.Value) typ
 	}
 
 	stream := obj.Value.(*object.Stream)
+	hadConsumer := stream.HasConsumer(groupName, consumer)
 	next, claimed, deleted := stream.AutoClaim(groupName, consumer, minIdleMs, start, count, justID)
+	if !hadConsumer && stream.HasConsumer(groupName, consumer) {
+		ctx.Engine.NotifyKeyEvent(ctx.DB, uint32(keyevent.FlagStream), "xgroup-createconsumer", key)
+	}
 
 	claimedValues := make([]types.Value, 0, len(claimed))
 	if justID {

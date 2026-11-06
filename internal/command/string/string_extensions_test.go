@@ -18,7 +18,7 @@ func TestDigestBasic(t *testing.T) {
 	cmd := DigestCommand{}
 
 	// Set a key
-	eng.Set("k", &object.Object{Type: object.TypeString, Value: "hello world"})
+	eng.Set("k", &object.Object{Type: object.TypeString, Value: []byte("hello world")})
 	res := cmd.Execute(ctx, []types.Value{types.NewString("k")})
 	if res.Type != types.TypeBulkString {
 		t.Fatalf("expected BulkString, got %v", res)
@@ -39,8 +39,8 @@ func TestDigestConsistency(t *testing.T) {
 	ctx := &context.Context{Engine: eng}
 	cmd := DigestCommand{}
 
-	eng.Set("k1", &object.Object{Type: object.TypeString, Value: "identical"})
-	eng.Set("k2", &object.Object{Type: object.TypeString, Value: "identical"})
+	eng.Set("k1", &object.Object{Type: object.TypeString, Value: []byte("identical")})
+	eng.Set("k2", &object.Object{Type: object.TypeString, Value: []byte("identical")})
 
 	r1 := string(cmd.Execute(ctx, []types.Value{types.NewString("k1")}).Str)
 	r2 := string(cmd.Execute(ctx, []types.Value{types.NewString("k2")}).Str)
@@ -48,7 +48,7 @@ func TestDigestConsistency(t *testing.T) {
 		t.Errorf("same content should have same digest: %q vs %q", r1, r2)
 	}
 
-	eng.Set("k3", &object.Object{Type: object.TypeString, Value: "different"})
+	eng.Set("k3", &object.Object{Type: object.TypeString, Value: []byte("different")})
 	r3 := string(cmd.Execute(ctx, []types.Value{types.NewString("k3")}).Str)
 	if r1 == r3 {
 		t.Errorf("different content should have different digest")
@@ -82,7 +82,7 @@ func TestDigestLeadingZeros(t *testing.T) {
 	ctx := &context.Context{Engine: eng}
 	cmd := DigestCommand{}
 	val := "v8lf0c11xh8ymlqztfd3eeq16kfn4sspw7fqmnuuq3k3t75em5wdizgcdw7uc26nnf961u2jkfzkjytls2kwlj7626sd"
-	eng.Set("foo", &object.Object{Type: object.TypeString, Value: val})
+	eng.Set("foo", &object.Object{Type: object.TypeString, Value: []byte(val)})
 	res := cmd.Execute(ctx, []types.Value{types.NewString("foo")})
 	if len(res.Str) != 16 {
 		t.Errorf("expected exactly 16 hex chars, got %q", string(res.Str))
@@ -96,7 +96,7 @@ func TestDelexIFEQ(t *testing.T) {
 	ctx := &context.Context{Engine: eng}
 	cmd := DelexCommand{}
 
-	eng.Set("k", &object.Object{Type: object.TypeString, Value: "hello"})
+	eng.Set("k", &object.Object{Type: object.TypeString, Value: []byte("hello")})
 
 	// Match: should delete
 	res := cmd.Execute(ctx, []types.Value{
@@ -110,7 +110,7 @@ func TestDelexIFEQ(t *testing.T) {
 	}
 
 	// Re-set; no match: should NOT delete
-	eng.Set("k", &object.Object{Type: object.TypeString, Value: "hello"})
+	eng.Set("k", &object.Object{Type: object.TypeString, Value: []byte("hello")})
 	res = cmd.Execute(ctx, []types.Value{
 		types.NewString("k"), types.NewString("IFEQ"), types.NewString("world"),
 	})
@@ -127,7 +127,7 @@ func TestDelexIFNE(t *testing.T) {
 	ctx := &context.Context{Engine: eng}
 	cmd := DelexCommand{}
 
-	eng.Set("k", &object.Object{Type: object.TypeString, Value: "hello"})
+	eng.Set("k", &object.Object{Type: object.TypeString, Value: []byte("hello")})
 
 	// Values differ: should delete
 	res := cmd.Execute(ctx, []types.Value{
@@ -138,7 +138,7 @@ func TestDelexIFNE(t *testing.T) {
 	}
 
 	// Re-set; same value: should NOT delete
-	eng.Set("k", &object.Object{Type: object.TypeString, Value: "hello"})
+	eng.Set("k", &object.Object{Type: object.TypeString, Value: []byte("hello")})
 	res = cmd.Execute(ctx, []types.Value{
 		types.NewString("k"), types.NewString("IFNE"), types.NewString("hello"),
 	})
@@ -153,7 +153,7 @@ func TestDelexIFDEQ(t *testing.T) {
 	digestCmd := DigestCommand{}
 	delexCmd := DelexCommand{}
 
-	eng.Set("k", &object.Object{Type: object.TypeString, Value: "hello"})
+	eng.Set("k", &object.Object{Type: object.TypeString, Value: []byte("hello")})
 	digestRes := digestCmd.Execute(ctx, []types.Value{types.NewString("k")})
 	goodDigest := string(digestRes.Str)
 
@@ -166,7 +166,7 @@ func TestDelexIFDEQ(t *testing.T) {
 	}
 
 	// Re-set; wrong digest: should NOT delete
-	eng.Set("k", &object.Object{Type: object.TypeString, Value: "hello"})
+	eng.Set("k", &object.Object{Type: object.TypeString, Value: []byte("hello")})
 	wrongDigest := strings.Repeat("0", 16)
 	if wrongDigest == goodDigest {
 		wrongDigest = strings.Repeat("1", 16)
@@ -183,7 +183,7 @@ func TestDelexInvalidCondition(t *testing.T) {
 	eng := core.New()
 	ctx := &context.Context{Engine: eng}
 	cmd := DelexCommand{}
-	eng.Set("k", &object.Object{Type: object.TypeString, Value: "hello"})
+	eng.Set("k", &object.Object{Type: object.TypeString, Value: []byte("hello")})
 
 	res := cmd.Execute(ctx, []types.Value{
 		types.NewString("k"), types.NewString("INVALID"), types.NewString("hello"),
@@ -197,7 +197,7 @@ func TestDelexInvalidDigestFormat(t *testing.T) {
 	eng := core.New()
 	ctx := &context.Context{Engine: eng}
 	cmd := DelexCommand{}
-	eng.Set("k", &object.Object{Type: object.TypeString, Value: "hello"})
+	eng.Set("k", &object.Object{Type: object.TypeString, Value: []byte("hello")})
 
 	// Too short
 	res := cmd.Execute(ctx, []types.Value{
@@ -271,8 +271,8 @@ func TestLCSBasic(t *testing.T) {
 	ctx := &context.Context{Engine: eng}
 	cmd := LCSCommand{}
 
-	eng.Set("k1", &object.Object{Type: object.TypeString, Value: "ohmytext"})
-	eng.Set("k2", &object.Object{Type: object.TypeString, Value: "mynewtext"})
+	eng.Set("k1", &object.Object{Type: object.TypeString, Value: []byte("ohmytext")})
+	eng.Set("k2", &object.Object{Type: object.TypeString, Value: []byte("mynewtext")})
 
 	res := cmd.Execute(ctx, []types.Value{types.NewString("k1"), types.NewString("k2")})
 	if string(res.Str) != "mytext" {
@@ -285,8 +285,8 @@ func TestLCSLen(t *testing.T) {
 	ctx := &context.Context{Engine: eng}
 	cmd := LCSCommand{}
 
-	eng.Set("k1", &object.Object{Type: object.TypeString, Value: "ohmytext"})
-	eng.Set("k2", &object.Object{Type: object.TypeString, Value: "mynewtext"})
+	eng.Set("k1", &object.Object{Type: object.TypeString, Value: []byte("ohmytext")})
+	eng.Set("k2", &object.Object{Type: object.TypeString, Value: []byte("mynewtext")})
 
 	res := cmd.Execute(ctx, []types.Value{
 		types.NewString("k1"), types.NewString("k2"), types.NewString("LEN"),
@@ -304,7 +304,7 @@ func TestSetIFEQ(t *testing.T) {
 	cmd := SetCommand{}
 	getCmd := GetCommand{}
 
-	eng.Set("k", &object.Object{Type: object.TypeString, Value: "hello"})
+	eng.Set("k", &object.Object{Type: object.TypeString, Value: []byte("hello")})
 
 	// Match: should set
 	res := cmd.Execute(ctx, []types.Value{
@@ -320,7 +320,7 @@ func TestSetIFEQ(t *testing.T) {
 	}
 
 	// No match: should NOT set
-	eng.Set("k", &object.Object{Type: object.TypeString, Value: "hello"})
+	eng.Set("k", &object.Object{Type: object.TypeString, Value: []byte("hello")})
 	res = cmd.Execute(ctx, []types.Value{
 		types.NewString("k"), types.NewString("world"),
 		types.NewString("IFEQ"), types.NewString("different"),
@@ -339,7 +339,7 @@ func TestSetIFEQWithGET(t *testing.T) {
 	ctx := &context.Context{Engine: eng}
 	cmd := SetCommand{}
 
-	eng.Set("k", &object.Object{Type: object.TypeString, Value: "hello"})
+	eng.Set("k", &object.Object{Type: object.TypeString, Value: []byte("hello")})
 
 	// Match + GET: returns old value
 	res := cmd.Execute(ctx, []types.Value{
@@ -352,7 +352,7 @@ func TestSetIFEQWithGET(t *testing.T) {
 	}
 
 	// No match + GET: returns old value (even though not set)
-	eng.Set("k2", &object.Object{Type: object.TypeString, Value: "hello"})
+	eng.Set("k2", &object.Object{Type: object.TypeString, Value: []byte("hello")})
 	res = cmd.Execute(ctx, []types.Value{
 		types.NewString("k2"), types.NewString("world"),
 		types.NewString("IFEQ"), types.NewString("different"),
@@ -369,7 +369,7 @@ func TestSetIFDEQ(t *testing.T) {
 	setCmd := SetCommand{}
 	digestCmd := DigestCommand{}
 
-	eng.Set("k", &object.Object{Type: object.TypeString, Value: "hello"})
+	eng.Set("k", &object.Object{Type: object.TypeString, Value: []byte("hello")})
 	digest := string(digestCmd.Execute(ctx, []types.Value{types.NewString("k")}).Str)
 
 	// Correct digest: should set
@@ -387,7 +387,7 @@ func TestSetCaseInsensitiveConditions(t *testing.T) {
 	ctx := &context.Context{Engine: eng}
 	cmd := SetCommand{}
 
-	eng.Set("k", &object.Object{Type: object.TypeString, Value: "hello"})
+	eng.Set("k", &object.Object{Type: object.TypeString, Value: []byte("hello")})
 	res := cmd.Execute(ctx, []types.Value{
 		types.NewString("k"), types.NewString("world"),
 		types.NewString("ifeq"), types.NewString("hello"), // lowercase

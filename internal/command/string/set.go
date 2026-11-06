@@ -1,6 +1,7 @@
 package str
 
 import (
+	"bytes"
 	"errors"
 	"strconv"
 	"strings"
@@ -25,7 +26,7 @@ func (c SetCommand) Execute(ctx *context.Context, args []types.Value) types.Valu
 	// Use unsafe.String for the key: the string is used only as a map key
 	// inside Engine.Set and does not escape to the heap in the common path.
 	key := unsafe.String(unsafe.SliceData(args[0].Str), len(args[0].Str))
-	val := string(args[1].Str) // value must be a real string (stored in Object)
+	val := args[1].Str // value is stored directly (RESP parser owns a fresh buffer)
 
 	var expireAt int64 // 0 = no expiry
 	nx := false        // SET only if Not eXists
@@ -111,26 +112,36 @@ func (c SetCommand) Execute(ctx *context.Context, args []types.Value) types.Valu
 		return types.NewError("ERR syntax error")
 	}
 
-	// Always fetch existing object for NX/XX/GET/KEEPTTL/conditional checks
-	// and for key event notifications (new/overwritten/type_changed).
+	// Plain SET is the dominant write path. When keyspace notifications are
+	// disabled, no observable result depends on the previous object, so avoid
+	// the extra shard lookup before replacing the value.
+	if len(args) == 2 && ctx.Engine.GetNotifyFlags() == "" {
+		obj := object.AcquireStringObject(val)
+		ctx.Engine.Set(key, obj)
+		ctx.Engine.NotifyKeyEvent(ctx.DB, uint32(keyevent.FlagString), "set", key)
+		return types.RespOK
+	}
+
+	// Fetch the existing object only for option processing or when keyspace
+	// notifications need its type and existence information.
 	var oldObj *object.Object
 	oldObj, _ = ctx.Engine.Get(key)
 
 	// ── GET option: validate type up-front (WRONGTYPE before any SET) ─────
-	var oldStrVal string
+	var oldStrVal []byte
 	var oldStrIsValid bool
 	if getOld && oldObj != nil {
 		if oldObj.Type != object.TypeString {
 			return types.NewError("WRONGTYPE Operation against a key holding the wrong kind of value")
 		}
-		oldStrVal, oldStrIsValid = oldObj.Value.(string)
+		oldStrVal, oldStrIsValid = oldObj.Value.([]byte)
 	}
 
 	// ── NX: only set if key does not exist ────────────────────────────────
 	if nx && oldObj != nil {
 		if getOld {
 			if oldStrIsValid {
-				return types.Value{Type: types.TypeBulkString, Str: []byte(oldStrVal)}
+				return types.Value{Type: types.TypeBulkString, Str: oldStrVal}
 			}
 			return types.RespNil
 		}
@@ -174,16 +185,16 @@ func (c SetCommand) Execute(ctx *context.Context, args []types.Value) types.Valu
 				condMet = true
 			}
 		} else {
-			sv, _ := oldObj.Value.(string)
+			sv, _ := oldObj.Value.([]byte)
 			switch cond {
 			case DelexIFEQ:
-				condMet = sv == string(condArg)
+				condMet = bytes.Equal(sv, condArg)
 			case DelexIFNE:
-				condMet = sv != string(condArg)
+				condMet = !bytes.Equal(sv, condArg)
 			case DelexIFDEQ:
-				condMet = digestString(sv) == condDigest
+				condMet = digestStringBytes(sv) == condDigest
 			case DelexIFDNE:
-				condMet = digestString(sv) != condDigest
+				condMet = digestStringBytes(sv) != condDigest
 			}
 		}
 
@@ -194,7 +205,7 @@ func (c SetCommand) Execute(ctx *context.Context, args []types.Value) types.Valu
 					return types.RespNil
 				}
 				if oldStrIsValid {
-					return types.Value{Type: types.TypeBulkString, Str: []byte(oldStrVal)}
+					return types.Value{Type: types.TypeBulkString, Str: oldStrVal}
 				}
 				return types.RespNil
 			}
@@ -224,7 +235,7 @@ func (c SetCommand) Execute(ctx *context.Context, args []types.Value) types.Valu
 
 		if getOld {
 			if oldStrIsValid {
-				return types.Value{Type: types.TypeBulkString, Str: []byte(oldStrVal)}
+				return types.Value{Type: types.TypeBulkString, Str: oldStrVal}
 			}
 			return types.RespNil
 		}
@@ -248,9 +259,9 @@ func (c SetCommand) Execute(ctx *context.Context, args []types.Value) types.Valu
 	}
 
 	if expireAt > 0 {
-		ctx.ReplicateAs = [][]byte{[]byte("SET"), args[0].Str, []byte(val), []byte("PXAT"), []byte(strconv.FormatInt(expireAt, 10))}
+		ctx.ReplicateAs = [][]byte{[]byte("SET"), args[0].Str, val, []byte("PXAT"), []byte(strconv.FormatInt(expireAt, 10))}
 	} else if keepTTL {
-		ctx.ReplicateAs = [][]byte{[]byte("SET"), args[0].Str, []byte(val), []byte("KEEPTTL")}
+		ctx.ReplicateAs = [][]byte{[]byte("SET"), args[0].Str, val, []byte("KEEPTTL")}
 	}
 
 	if getOld {
@@ -258,7 +269,7 @@ func (c SetCommand) Execute(ctx *context.Context, args []types.Value) types.Valu
 			return types.RespNil
 		}
 		if oldStrIsValid {
-			return types.Value{Type: types.TypeBulkString, Str: []byte(oldStrVal)}
+			return types.Value{Type: types.TypeBulkString, Str: oldStrVal}
 		}
 		return types.RespNil
 	}

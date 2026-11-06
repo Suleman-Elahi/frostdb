@@ -21,11 +21,11 @@ func serializeObject(key string, obj *object.Object) (checkpoint.Record, error) 
 
 	switch obj.Type {
 	case object.TypeString:
-		s, ok := obj.Value.(string)
+		s, ok := obj.Value.([]byte)
 		if !ok {
 			return checkpoint.Record{}, fmt.Errorf("invalid string value")
 		}
-		data = []byte(s)
+		data = s
 	case object.TypeList:
 		l, ok := obj.Value.(*object.List)
 		if !ok {
@@ -117,7 +117,7 @@ func deserializeObject(rec checkpoint.Record) (*object.Object, error) {
 
 	switch obj.Type {
 	case object.TypeString:
-		obj.Value = string(rec.Data)
+		obj.Value = rec.Data
 	case object.TypeList:
 		var values [][]byte
 		if err := json.Unmarshal(rec.Data, &values); err != nil {
@@ -127,6 +127,7 @@ func deserializeObject(rec checkpoint.Record) (*object.Object, error) {
 		for _, v := range values {
 			l.PushBack(v)
 		}
+		l.RecomputeEncodingAuto()
 		obj.Value = l
 	case object.TypeHash:
 		var m map[string]string

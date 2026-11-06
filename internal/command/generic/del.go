@@ -26,5 +26,8 @@ func (c DelCommand) Execute(ctx *context.Context, args []types.Value) types.Valu
 		}
 	}
 
+	if count == 0 {
+		ctx.SkipReplication = true
+	}
 	return types.NewInt(int64(count))
 }

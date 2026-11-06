@@ -13,7 +13,7 @@ func TestEngine_GetSet(t *testing.T) {
 	obj := &object.Object{
 		Type:     object.TypeString,
 		Encoding: object.EncodingRaw,
-		Value:    "hello",
+		Value:    []byte("hello"),
 	}
 
 	engine.Set("mykey", obj)
@@ -23,7 +23,7 @@ func TestEngine_GetSet(t *testing.T) {
 		t.Fatalf("Expected key to exist")
 	}
 
-	if got.Value.(string) != "hello" {
+	if string(got.Value.([]byte)) != "hello" {
 		t.Errorf("Expected value hello, got %v", got.Value)
 	}
 }
@@ -34,7 +34,7 @@ func TestEngine_Del(t *testing.T) {
 	obj := &object.Object{
 		Type:     object.TypeString,
 		Encoding: object.EncodingRaw,
-		Value:    "hello",
+		Value:    []byte("hello"),
 	}
 
 	engine.Set("mykey", obj)
@@ -55,7 +55,7 @@ func TestEngine_Expire(t *testing.T) {
 	obj := &object.Object{
 		Type:     object.TypeString,
 		Encoding: object.EncodingRaw,
-		Value:    "hello",
+		Value:    []byte("hello"),
 		ExpireAt: time.Now().UnixMilli() - 1000, // Expired 1 second ago
 	}
 

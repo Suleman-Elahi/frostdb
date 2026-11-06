@@ -57,6 +57,14 @@ func (c MoveCommand) Execute(ctx *context.Context, args []types.Value) types.Val
 		return types.NewError("ERR invalid DB index")
 	}
 	if mdb.MoveKey(key, ctx.DB, db) {
+		if !ctx.ExecutingMulti && !ctx.InScript {
+			if ctx.UnlockKeys != nil {
+				ctx.UnlockKeys()
+			}
+			if dstEngine := mdb.SelectDB(db); dstEngine != nil {
+				dstEngine.SignalKey(key)
+			}
+		}
 		return types.RespOne
 	}
 	return types.RespZero
@@ -84,14 +92,17 @@ func (c SwapDBCommand) Execute(ctx *context.Context, args []types.Value) types.V
 	if db1 >= mdb.NumDBs() || db2 >= mdb.NumDBs() {
 		return types.NewError("ERR invalid DB index")
 	}
-	mdb.SwapDB(db1, db2) //nolint:errcheck
 
-	// Propagate SWAPDB to replicas for replication testing
+	// Propagate SWAPDB to replicas before waking blocked clients on the swapped DBs.
 	ctx.Engine.LogCommand([][]byte{
 		[]byte("SWAPDB"),
 		args[0].Str,
 		args[1].Str,
 	})
+	if !ctx.ExecutingMulti && !ctx.InScript && ctx.UnlockKeys != nil {
+		ctx.UnlockKeys()
+	}
+	mdb.SwapDB(db1, db2) //nolint:errcheck
 
 	return types.RespOK
 }

@@ -18,7 +18,7 @@ func (c MSetCommand) Execute(ctx *context.Context, args []types.Value) types.Val
 
 	for i := 0; i < len(args); i += 2 {
 		key := string(args[i].Str)
-		val := string(args[i+1].Str)
+		val := args[i+1].Str
 		ctx.Engine.Set(key, object.AcquireStringObject(val))
 	}
 	return types.RespOK
@@ -43,7 +43,7 @@ func (c MSetNXCommand) Execute(ctx *context.Context, args []types.Value) types.V
 
 	for i := 0; i < len(args); i += 2 {
 		key := string(args[i].Str)
-		val := string(args[i+1].Str)
+		val := args[i+1].Str
 		ctx.Engine.Set(key, object.AcquireStringObject(val))
 	}
 	return types.RespOne

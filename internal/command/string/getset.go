@@ -20,7 +20,7 @@ func (c GetSetCommand) Execute(ctx *context.Context, args []types.Value) types.V
 	}
 
 	key := string(args[0].Str)
-	newVal := string(args[1].Str)
+	newVal := args[1].Str
 
 	// Get old value
 	obj, ok := ctx.Engine.GetBytes(args[0].Str)
@@ -28,11 +28,11 @@ func (c GetSetCommand) Execute(ctx *context.Context, args []types.Value) types.V
 	if !ok {
 		result = types.RespNil
 	} else {
-		strVal, isStr := obj.Value.(string)
+		strVal, isStr := obj.Value.([]byte)
 		if !isStr {
 			return types.NewError("WRONGTYPE Operation against a key holding the wrong kind of value")
 		}
-		result = types.NewString(strVal)
+		result = types.NewBytes(strVal)
 	}
 
 	// Set new value (clears TTL like Redis)
@@ -62,10 +62,11 @@ func (c GetExCommand) Execute(ctx *context.Context, args []types.Value) types.Va
 
 	obj, ok := ctx.Engine.GetBytes(args[0].Str)
 	if !ok {
+		ctx.SkipReplication = true
 		return types.RespNil
 	}
 
-	strVal, isStr := obj.Value.(string)
+	strVal, isStr := obj.Value.([]byte)
 	if !isStr {
 		return types.NewError("WRONGTYPE Operation against a key holding the wrong kind of value")
 	}
@@ -102,7 +103,7 @@ func (c GetExCommand) Execute(ctx *context.Context, args []types.Value) types.Va
 		ctx.SkipReplication = true
 	}
 
-	return types.NewString(strVal)
+	return types.NewBytes(strVal)
 }
 
 // GetDelCommand implements GETDEL key
@@ -122,7 +123,7 @@ func (c GetDelCommand) Execute(ctx *context.Context, args []types.Value) types.V
 		return types.RespNil
 	}
 
-	strVal, isStr := obj.Value.(string)
+	strVal, isStr := obj.Value.([]byte)
 	if !isStr {
 		ctx.SkipReplication = true
 		return types.NewError("WRONGTYPE Operation against a key holding the wrong kind of value")
@@ -130,5 +131,5 @@ func (c GetDelCommand) Execute(ctx *context.Context, args []types.Value) types.V
 
 	ctx.Engine.Del(key)
 	ctx.ReplicateAs = [][]byte{[]byte("DEL"), args[0].Str}
-	return types.NewString(strVal)
+	return types.NewBytes(strVal)
 }

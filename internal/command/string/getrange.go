@@ -33,7 +33,7 @@ func (c GetRangeCommand) Execute(ctx *context.Context, args []types.Value) types
 		return types.NewError("WRONGTYPE Operation against a key holding the wrong kind of value")
 	}
 
-	s, _ := obj.Value.(string)
+	s, _ := obj.Value.([]byte)
 	length := len(s)
 
 	// Step 1: If both indices are negative AND start > end, return empty
@@ -68,7 +68,7 @@ func (c GetRangeCommand) Execute(ctx *context.Context, args []types.Value) types
 		return types.NewString("")
 	}
 
-	return types.NewString(s[start : end+1])
+	return types.NewBytes(s[start : end+1])
 }
 
 // SubstrCommand is an alias for GETRANGE (deprecated since Redis 2.0).

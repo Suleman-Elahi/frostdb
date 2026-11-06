@@ -38,13 +38,17 @@ func (id StreamID) Compare(other StreamID) int {
 }
 
 func ParseStreamID(s string) (StreamID, error) {
+	return ParseStreamIDWithDefaultSeq(s, 0)
+}
+
+func ParseStreamIDWithDefaultSeq(s string, defaultSeq uint64) (StreamID, error) {
 	idx := strings.IndexByte(s, '-')
 	if idx < 0 {
 		ms, err := strconv.ParseUint(s, 10, 64)
 		if err != nil {
 			return StreamID{}, fmt.Errorf("ERR Invalid stream ID")
 		}
-		return StreamID{MS: ms, Seq: 0}, nil
+		return StreamID{MS: ms, Seq: defaultSeq}, nil
 	}
 	ms, err := strconv.ParseUint(s[:idx], 10, 64)
 	if err != nil {
@@ -158,6 +162,12 @@ func (s *Stream) LastGeneratedID() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return StreamID{MS: s.lastMS, Seq: s.lastSeq}.String()
+}
+
+func (s *Stream) LastGeneratedStreamID() StreamID {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return StreamID{MS: s.lastMS, Seq: s.lastSeq}
 }
 
 // SetLastID sets the last generated ID for the stream.
@@ -316,8 +326,8 @@ func (s *Stream) addLocked(id string, fields []StreamField) (string, error) {
 	s.length++
 	s.entriesAdded++
 
-	// Track recorded first entry ID (set once when first entry is added)
-	if s.entriesAdded == 1 {
+	// Track recorded first entry ID (set whenever stream transitions from empty to 1 entry, matching Redis t_stream.c)
+	if s.length == 1 {
 		s.recordedFirstEntryID = actualID
 	}
 
@@ -350,21 +360,11 @@ func (s *Stream) CreateGroup(name, startID string) error {
 
 	var resolved StreamID
 	if startID == "$" {
-		if s.Blocks.Len() > 0 {
-			lastBlock, _ := s.Blocks.Max()
-
-			// Find the last entry in the block
-			it := lastBlock.Node.Iterator()
-			var lastEntry StreamEntry
-			for it.HasNext() {
-				lastEntry = it.Next()
-			}
-			resolved = lastEntry.ID
-		}
+		resolved = StreamID{MS: s.lastMS, Seq: s.lastSeq}
 	} else {
 		parsed, err := ParseStreamID(startID)
 		if err != nil {
-			parsed = StreamID{}
+			return fmt.Errorf("ERR Invalid stream ID specified as stream command argument")
 		}
 		resolved = parsed
 	}
@@ -379,6 +379,86 @@ func (s *Stream) CreateGroup(name, startID string) error {
 	return nil
 }
 
+func (s *Stream) SetGroupID(name, startID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	g, exists := s.Groups[name]
+	if !exists {
+		return fmt.Errorf("NOGROUP No such consumer group '%s' for key name", name)
+	}
+
+	var resolved StreamID
+	if startID == "$" {
+		resolved = StreamID{MS: s.lastMS, Seq: s.lastSeq}
+	} else {
+		parsed, err := ParseStreamID(startID)
+		if err != nil {
+			return fmt.Errorf("ERR Invalid stream ID specified as stream command argument")
+		}
+		resolved = parsed
+	}
+	g.LastDeliveredID = resolved
+	return nil
+}
+
+func (s *Stream) DestroyGroup(name string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.Groups[name]; !exists {
+		return false
+	}
+	delete(s.Groups, name)
+	return true
+}
+
+func (s *Stream) HasConsumer(groupName, consumerName string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	g, exists := s.Groups[groupName]
+	if !exists {
+		return false
+	}
+	_, ok := g.Consumers[consumerName]
+	return ok
+}
+
+func (s *Stream) CreateConsumer(groupName, consumerName string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	g, exists := s.Groups[groupName]
+	if !exists {
+		return 0, fmt.Errorf("NOGROUP No such consumer group '%s' for key name", groupName)
+	}
+	if _, ok := g.Consumers[consumerName]; ok {
+		return 0, nil
+	}
+	g.Consumers[consumerName] = 0
+	return 1, nil
+}
+
+func (s *Stream) DelConsumer(groupName, consumerName string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	g, exists := s.Groups[groupName]
+	if !exists {
+		return 0, fmt.Errorf("NOGROUP No such consumer group '%s' for key name", groupName)
+	}
+	removed := 0
+	for id, pe := range g.Pending {
+		if pe.Consumer == consumerName {
+			delete(g.Pending, id)
+			removed++
+		}
+	}
+	delete(g.Consumers, consumerName)
+	return removed, nil
+}
+
 func (s *Stream) ReadGroup(groupName, consumer string, count int, id string, noAck bool) ([]StreamEntry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -386,6 +466,10 @@ func (s *Stream) ReadGroup(groupName, consumer string, count int, id string, noA
 	group, ok := s.Groups[groupName]
 	if !ok {
 		return nil, fmt.Errorf("NOGROUP No such key or consumer group")
+	}
+
+	if _, exists := group.Consumers[consumer]; !exists {
+		group.Consumers[consumer] = 0
 	}
 
 	if id != ">" {
@@ -614,9 +698,12 @@ func (s *Stream) entriesAfterLocked(group *StreamGroup, count int) []StreamEntry
 
 func (s *Stream) readPendingLocked(group *StreamGroup, consumer string, count int, startIDStr string, noAck bool) []StreamEntry {
 	startID, _ := ParseStreamID(startIDStr)
+	if _, exists := group.Consumers[consumer]; !exists {
+		group.Consumers[consumer] = 0
+	}
 	ids := make([]StreamID, 0, len(group.Pending))
-	for id := range group.Pending {
-		if id.Compare(startID) > 0 {
+	for id, pending := range group.Pending {
+		if pending.Consumer == consumer && id.Compare(startID) > 0 {
 			ids = append(ids, id)
 		}
 	}
@@ -631,13 +718,15 @@ func (s *Stream) readPendingLocked(group *StreamGroup, consumer string, count in
 	result := make([]StreamEntry, 0, len(ids))
 	for _, id := range ids {
 		pending := group.Pending[id]
-		pending.Consumer = consumer
-		pending.DeliveryCount++
-		pending.LastDeliveryMs = time.Now().UnixMilli()
-		if !noAck {
-			group.Consumers[consumer]++
+		if !s.hasIDLocked(id) {
+			result = append(result, StreamEntry{ID: id, Fields: nil})
+			continue
 		}
-		result = append(result, pending.Entry)
+		if pending.Entry.Fields == nil {
+			result = append(result, StreamEntry{ID: id, Fields: []StreamField{}})
+		} else {
+			result = append(result, pending.Entry)
+		}
 	}
 	return result
 }
@@ -729,53 +818,32 @@ func (s *Stream) Delete(ids ...string) int {
 		if err != nil {
 			continue
 		}
-		// Find the block containing this ID
-		var targetBlock StreamBlock
-		found := false
-		s.Blocks.DescendLessOrEqual(StreamBlock{FirstID: id}, func(b StreamBlock) bool {
-			targetBlock = b
-			found = true
-			return false
-		})
-		if !found {
-			continue
-		}
-		// Try to remove from this block
-		if targetBlock.Node.DeleteEntry(id) {
+		if s.deleteIDLocked(id, false) {
 			deleted++
-			s.length--
-			// Track the maximum deleted entry ID
-			if id.Compare(s.maxDeletedEntryID) > 0 {
-				s.maxDeletedEntryID = id
-			}
-			// Remove block if empty
-			if targetBlock.Node.Count == 0 {
-				s.Blocks.Delete(targetBlock)
-			}
-			// Update recordedFirstEntryID if we deleted the first entry
-			if id.Compare(s.recordedFirstEntryID) == 0 {
-				s.updateRecordedFirstEntryIDLocked()
-			}
 		}
 	}
 	return deleted
 }
 
 // updateRecordedFirstEntryIDLocked updates recordedFirstEntryID to the current first entry.
+// When the stream becomes empty, recordedFirstEntryID is reset to 0-0 (matching Redis t_stream.c).
 // Must be called with s.mu held.
 func (s *Stream) updateRecordedFirstEntryIDLocked() {
 	if s.Blocks.Len() == 0 {
-		// Stream is empty, keep the original recordedFirstEntryID
+		s.recordedFirstEntryID = StreamID{}
 		return
 	}
 	firstBlock, ok := s.Blocks.Min()
 	if !ok {
+		s.recordedFirstEntryID = StreamID{}
 		return
 	}
 	it := firstBlock.Node.Iterator()
 	if it.HasNext() {
 		entry := it.Next()
 		s.recordedFirstEntryID = entry.ID
+	} else {
+		s.recordedFirstEntryID = StreamID{}
 	}
 }
 
@@ -800,12 +868,21 @@ func (s *Stream) deleteIDLocked(id StreamID, delRef bool) bool {
 	}
 	if targetBlock.Node.Count == 0 {
 		s.Blocks.Delete(targetBlock)
+	} else {
+		newFirst := targetBlock.Node.FirstEntry().ID
+		if newFirst.Compare(targetBlock.FirstID) != 0 {
+			s.Blocks.Delete(targetBlock)
+			s.Blocks.ReplaceOrInsert(StreamBlock{
+				FirstID: newFirst,
+				Node:    targetBlock.Node,
+			})
+		}
 	}
 	if delRef {
 		s.cleanupEntryRefsLocked(id)
 	}
-	// Update recordedFirstEntryID if we deleted the first entry
-	if id.Compare(s.recordedFirstEntryID) == 0 {
+	// Update recordedFirstEntryID if we deleted the first entry or emptied the stream
+	if s.length == 0 || id.Compare(s.recordedFirstEntryID) == 0 {
 		s.updateRecordedFirstEntryIDLocked()
 	}
 	return true
@@ -848,6 +925,9 @@ func (s *Stream) DeleteWithPolicy(id StreamID, policy StreamTrimRefPolicy) int64
 	switch policy {
 	case StreamTrimAcked:
 		if !s.isAckedByAllGroupsLocked(id) {
+			if !s.hasIDLocked(id) {
+				return -1
+			}
 			return 2
 		}
 		if s.deleteIDLocked(id, false) {
@@ -929,98 +1009,193 @@ func (s *Stream) isAckedByAllGroupsLocked(id StreamID) bool {
 	return true
 }
 
-func (s *Stream) nextTrimCandidateLocked(minID *StreamID, policy StreamTrimRefPolicy) (StreamID, bool) {
-	var found StreamID
-	ok := false
-	s.Blocks.Ascend(func(b StreamBlock) bool {
-		it := b.Node.Iterator()
-		for it.HasNext() {
-			entry := it.Next()
-			if minID != nil && entry.ID.Compare(*minID) >= 0 {
-				return false
-			}
-			if policy == StreamTrimAcked && !s.isAckedByAllGroupsLocked(entry.ID) {
-				continue
-			}
-			found = entry.ID
-			ok = true
-			return false
-		}
-		return true
-	})
-	return found, ok
-}
-
-func approxTrimTarget(maxlen int) int {
-	if maxlen <= 0 {
-		return maxlen
+// streamTrimLocked implements Redis streamTrim (t_stream.c) for MAXLEN and MINID
+// with exact/approx (~), limit, and reference policy (KEEPREF, DELREF, ACKED).
+// Note: Trimming does NOT update maxDeletedEntryID (only XDEL/XDELEX/XACKDEL/XSETID do).
+func (s *Stream) streamTrimLocked(strategy string, maxlen int, minID StreamID, approx bool, limit int, policy StreamTrimRefPolicy) int {
+	if strategy == "MAXLEN" && s.length <= maxlen {
+		return 0
 	}
-	const bucket = 100
-	return ((maxlen + bucket - 1) / bucket) * bucket
-}
-
-func (s *Stream) TrimMaxLenWithPolicy(maxlen int, approx bool, policy StreamTrimRefPolicy) int {
-	// Fast path: common Redis behavior, no PEL-aware constraints.
-	if policy == StreamTrimKeepRef {
-		if approx {
-			return s.TrimMaxLen(approxTrimTarget(maxlen))
-		}
-		return s.TrimMaxLen(maxlen)
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	target := maxlen
-	if approx {
-		target = approxTrimTarget(maxlen)
-	}
-	if s.length <= target {
+	if s.Blocks.Len() == 0 {
 		return 0
 	}
 
-	removed := 0
-	delRef := policy == StreamTrimDelRef
-	for s.length > target {
-		id, ok := s.nextTrimCandidateLocked(nil, policy)
-		if !ok {
-			break
+	effectiveLimit := 0
+	if approx {
+		if limit < 0 {
+			maxEntries := int(GetStreamNodeMaxEntries())
+			if maxEntries > 0 {
+				effectiveLimit = 100 * maxEntries
+			} else {
+				effectiveLimit = 10000
+			}
+			if effectiveLimit <= 0 {
+				effectiveLimit = 10000
+			}
+			if effectiveLimit > 1000000 {
+				effectiveLimit = 1000000
+			}
+		} else {
+			effectiveLimit = limit
 		}
-		if !s.deleteIDLocked(id, delRef) {
-			break
-		}
-		removed++
 	}
-	return removed
+
+	blocks := make([]StreamBlock, 0, s.Blocks.Len())
+	s.Blocks.Ascend(func(b StreamBlock) bool {
+		blocks = append(blocks, b)
+		return true
+	})
+
+	deleted := 0
+	for _, b := range blocks {
+		if strategy == "MAXLEN" && s.length <= maxlen {
+			break
+		}
+
+		blockLen := b.Node.Len()
+		if blockLen == 0 {
+			s.Blocks.Delete(b)
+			continue
+		}
+
+		if effectiveLimit > 0 && (deleted+blockLen) > effectiveLimit {
+			break
+		}
+
+		var nodeEligible bool
+		if strategy == "MAXLEN" {
+			nodeEligible = (s.length - blockLen) >= maxlen
+		} else {
+			lastEntry := b.Node.LastEntry()
+			nodeEligible = lastEntry.ID.Compare(minID) < 0
+		}
+
+		if policy == StreamTrimKeepRef {
+			if nodeEligible {
+				s.Blocks.Delete(b)
+				s.length -= blockLen
+				deleted += blockLen
+				continue
+			}
+			if approx {
+				break
+			}
+
+			// Exact partial trim
+			if strategy == "MAXLEN" {
+				toRemove := s.length - maxlen
+				if toRemove > 0 {
+					b.Node.TrimFront(toRemove)
+					s.length -= toRemove
+					deleted += toRemove
+				}
+			} else {
+				trimmed := b.Node.TrimBeforeID(minID)
+				s.length -= trimmed
+				deleted += trimmed
+			}
+			s.Blocks.Delete(b)
+			if b.Node.Len() > 0 {
+				s.Blocks.ReplaceOrInsert(StreamBlock{
+					FirstID: b.Node.FirstEntry().ID,
+					Node:    b.Node,
+				})
+			}
+			break
+		}
+
+		// DELREF or ACKED policy
+		if approx && !nodeEligible {
+			break
+		}
+
+		it := b.Node.Iterator()
+		var kept []StreamEntry
+		modified := false
+		stopDeleting := false
+		for it.HasNext() {
+			entry := it.Next()
+			if stopDeleting {
+				kept = append(kept, entry)
+				continue
+			}
+			if strategy == "MAXLEN" && s.length <= maxlen {
+				stopDeleting = true
+				kept = append(kept, entry)
+				continue
+			}
+			if strategy == "MINID" && entry.ID.Compare(minID) >= 0 {
+				stopDeleting = true
+				kept = append(kept, entry)
+				continue
+			}
+
+			canDelete := true
+			if policy == StreamTrimAcked {
+				if !s.isAckedByAllGroupsLocked(entry.ID) {
+					canDelete = false
+				}
+			} else if policy == StreamTrimDelRef {
+				s.cleanupEntryRefsLocked(entry.ID)
+			}
+
+			if canDelete {
+				s.length--
+				deleted++
+				modified = true
+			} else {
+				kept = append(kept, entry)
+			}
+		}
+
+		if modified {
+			s.Blocks.Delete(b)
+			if len(kept) > 0 {
+				newNode := NewStreamNode()
+				for _, e := range kept {
+					newNode.AppendRaw(e)
+				}
+				s.Blocks.ReplaceOrInsert(StreamBlock{
+					FirstID: kept[0].ID,
+					Node:    newNode,
+				})
+			}
+		}
+
+		if nodeEligible {
+			continue
+		}
+		break
+	}
+
+	if deleted > 0 {
+		s.updateRecordedFirstEntryIDLocked()
+	}
+	return deleted
 }
 
-func (s *Stream) TrimMinIDWithPolicy(threshold string, _ bool, policy StreamTrimRefPolicy) int {
-	// Fast path: plain MINID trimming.
-	if policy == StreamTrimKeepRef {
-		return s.TrimMinID(threshold)
-	}
-
+func (s *Stream) TrimMaxLenFull(maxlen int, approx bool, limit int, policy StreamTrimRefPolicy) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.streamTrimLocked("MAXLEN", maxlen, StreamID{}, approx, limit, policy)
+}
 
+func (s *Stream) TrimMinIDFull(threshold string, approx bool, limit int, policy StreamTrimRefPolicy) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	minID, err := ParseStreamID(threshold)
 	if err != nil {
 		return 0
 	}
+	return s.streamTrimLocked("MINID", 0, minID, approx, limit, policy)
+}
 
-	removed := 0
-	delRef := policy == StreamTrimDelRef
-	for {
-		id, ok := s.nextTrimCandidateLocked(&minID, policy)
-		if !ok {
-			break
-		}
-		if !s.deleteIDLocked(id, delRef) {
-			break
-		}
-		removed++
-	}
-	return removed
+func (s *Stream) TrimMaxLenWithPolicy(maxlen int, approx bool, policy StreamTrimRefPolicy) int {
+	return s.TrimMaxLenFull(maxlen, approx, -1, policy)
+}
+
+func (s *Stream) TrimMinIDWithPolicy(threshold string, approx bool, policy StreamTrimRefPolicy) int {
+	return s.TrimMinIDFull(threshold, approx, -1, policy)
 }
 
 // Range returns entries with IDs between startStr and endStr (inclusive).
@@ -1045,7 +1220,7 @@ func (s *Stream) Range(startStr, endStr string, count int) []StreamEntry {
 			exclusiveStart = true
 			startStr = startStr[1:]
 		}
-		parsed, err := ParseStreamID(startStr)
+		parsed, err := ParseStreamIDWithDefaultSeq(startStr, 0)
 		if err != nil {
 			return nil
 		}
@@ -1059,15 +1234,26 @@ func (s *Stream) Range(startStr, endStr string, count int) []StreamEntry {
 			exclusiveEnd = true
 			endStr = endStr[1:]
 		}
-		parsed, err := ParseStreamID(endStr)
+		parsed, err := ParseStreamIDWithDefaultSeq(endStr, math.MaxUint64)
 		if err != nil {
 			return nil
 		}
 		endID = parsed
 	}
 
+	var startBlock StreamBlock
+	foundStartBlock := false
+	s.Blocks.DescendLessOrEqual(StreamBlock{FirstID: startID}, func(b StreamBlock) bool {
+		startBlock = b
+		foundStartBlock = true
+		return false
+	})
+
 	var result []StreamEntry
-	s.Blocks.Ascend(func(b StreamBlock) bool {
+	visitBlock := func(b StreamBlock) bool {
+		if b.FirstID.Compare(endID) > 0 {
+			return false
+		}
 		it := b.Node.Iterator()
 		for it.HasNext() {
 			entry := it.Next()
@@ -1088,199 +1274,35 @@ func (s *Stream) Range(startStr, endStr string, count int) []StreamEntry {
 			}
 		}
 		return count == 0 || len(result) < count
-	})
+	}
+
+	if foundStartBlock {
+		s.Blocks.AscendGreaterOrEqual(startBlock, visitBlock)
+	} else {
+		s.Blocks.Ascend(visitBlock)
+	}
 
 	return result
 }
 
 // TrimMaxLenApprox removes whole blocks until stream length is approximately <= maxlen.
-// With limit >= 0, it removes at most limit entries. With limit < 0, uses default limit of 100.
-// Returns count removed. This implements the ~ (approximate) behavior.
 func (s *Stream) TrimMaxLenApprox(maxlen int, limit int) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.length <= maxlen {
-		return 0
-	}
-
-	// Default limit for approximate trim is 100 entries per call
-	effectiveLimit := limit
-	if effectiveLimit < 0 {
-		effectiveLimit = 100
-	}
-
-	removed := 0
-	for s.Blocks.Len() > 0 {
-		// Check if we've hit the limit
-		if removed >= effectiveLimit {
-			break
-		}
-
-		first, ok := s.Blocks.Min()
-		if !ok {
-			break
-		}
-		blockLen := first.Node.Len()
-
-		// For approximate mode, we only remove whole blocks
-		// Stop if removing this block would go below maxlen
-		if s.length-blockLen < maxlen {
-			break
-		}
-
-		// Check limit - can we remove this whole block?
-		if removed+blockLen > effectiveLimit {
-			break
-		}
-
-		s.Blocks.Delete(first)
-		removed += blockLen
-		s.length -= blockLen
-	}
-
-	// Update recordedFirstEntryID after trimming
-	if removed > 0 {
-		s.updateRecordedFirstEntryIDLocked()
-	}
-
-	return removed
+	return s.TrimMaxLenFull(maxlen, true, limit, StreamTrimKeepRef)
 }
 
 // TrimMinIDApprox removes whole blocks with IDs less than threshold.
-// With limit >= 0, it removes at most limit entries. With limit < 0, uses default limit of 100.
-// Returns count removed.
 func (s *Stream) TrimMinIDApprox(threshold string, limit int) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	minID, err := ParseStreamID(threshold)
-	if err != nil {
-		return 0
-	}
-
-	// Default limit for approximate trim is 100 entries per call
-	effectiveLimit := limit
-	if effectiveLimit < 0 {
-		effectiveLimit = 100
-	}
-
-	removed := 0
-	for s.Blocks.Len() > 0 {
-		// Check if we've hit the limit
-		if removed >= effectiveLimit {
-			break
-		}
-
-		first, ok := s.Blocks.Min()
-		if !ok {
-			break
-		}
-
-		// For approximate mode, only remove if ENTIRE block is below threshold
-		lastEntry := first.Node.LastEntry()
-		if lastEntry.ID.Compare(minID) >= 0 {
-			break
-		}
-
-		blockLen := first.Node.Len()
-
-		// Check limit - can we remove this whole block?
-		if removed+blockLen > effectiveLimit {
-			break
-		}
-
-		s.Blocks.Delete(first)
-		removed += blockLen
-		s.length -= blockLen
-	}
-
-	// Update recordedFirstEntryID after trimming
-	if removed > 0 {
-		s.updateRecordedFirstEntryIDLocked()
-	}
-
-	return removed
+	return s.TrimMinIDFull(threshold, true, limit, StreamTrimKeepRef)
 }
 
 // TrimMaxLen removes oldest entries until stream length <= maxlen. Returns count removed.
 func (s *Stream) TrimMaxLen(maxlen int) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.length <= maxlen {
-		return 0
-	}
-
-	toRemove := s.length - maxlen
-	removed := 0
-
-	for removed < toRemove && s.Blocks.Len() > 0 {
-		first, ok := s.Blocks.Min()
-		if !ok {
-			break
-		}
-		blockLen := first.Node.Len()
-		if removed+blockLen <= toRemove {
-			// Remove entire block
-			s.Blocks.Delete(first)
-			removed += blockLen
-		} else {
-			// Partial trim from this block
-			need := toRemove - removed
-			first.Node.TrimFront(need)
-			removed += need
-		}
-	}
-
-	s.length -= removed
-
-	// Update recordedFirstEntryID after trimming
-	if removed > 0 {
-		s.updateRecordedFirstEntryIDLocked()
-	}
-
-	return removed
+	return s.TrimMaxLenFull(maxlen, false, 0, StreamTrimKeepRef)
 }
 
 // TrimMinID removes entries with IDs less than the given threshold. Returns count removed.
 func (s *Stream) TrimMinID(threshold string) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	minID, err := ParseStreamID(threshold)
-	if err != nil {
-		return 0
-	}
-
-	removed := 0
-	for s.Blocks.Len() > 0 {
-		first, ok := s.Blocks.Min()
-		if !ok {
-			break
-		}
-		// Check if entire block is below threshold
-		lastEntry := first.Node.LastEntry()
-		if lastEntry.ID.Compare(minID) < 0 {
-			blockLen := first.Node.Len()
-			s.Blocks.Delete(first)
-			removed += blockLen
-			continue
-		}
-		// Partial trim
-		trimmed := first.Node.TrimBeforeID(minID)
-		removed += trimmed
-		break
-	}
-
-	s.length -= removed
-
-	// Update recordedFirstEntryID after trimming
-	if removed > 0 {
-		s.updateRecordedFirstEntryIDLocked()
-	}
-
-	return removed
+	return s.TrimMinIDFull(threshold, false, 0, StreamTrimKeepRef)
 }
 
 func (s *Stream) RevRange(startStr, endStr string, count int) []StreamEntry {
@@ -1305,13 +1327,13 @@ func (s *Stream) RevRange(startStr, endStr string, count int) []StreamEntry {
 
 	startID := StreamID{MS: math.MaxUint64, Seq: math.MaxUint64}
 	if startStr != "+" {
-		if parsed, err := ParseStreamID(startStr); err == nil {
+		if parsed, err := ParseStreamIDWithDefaultSeq(startStr, math.MaxUint64); err == nil {
 			startID = parsed
 		}
 	}
 	endID := StreamID{}
 	if endStr != "-" {
-		if parsed, err := ParseStreamID(endStr); err == nil {
+		if parsed, err := ParseStreamIDWithDefaultSeq(endStr, 0); err == nil {
 			endID = parsed
 		}
 	}
@@ -1338,6 +1360,9 @@ func (s *Stream) RevRange(startStr, endStr string, count int) []StreamEntry {
 			if count > 0 && len(result) >= count {
 				return false
 			}
+		}
+		if b.FirstID.Compare(endID) < 0 {
+			return false
 		}
 		return true
 	})

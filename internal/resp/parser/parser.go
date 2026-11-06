@@ -16,11 +16,22 @@ import (
 	"frostdb/internal/resp/types"
 )
 
-var ErrInvalidSyntax = errors.New("invalid RESP syntax")
+var (
+	ErrInvalidSyntax = errors.New("invalid RESP syntax")
+	ErrInvalidLength = errors.New("RESP length out of range")
+)
 
-// readBufSize is the per-connection read buffer.
-// 32 KB amortises syscalls well for pipelined workloads.
-const readBufSize = 32 * 1024
+const (
+	// readBufSize is the per-connection read buffer. 32 KB amortises syscalls
+	// for pipelined workloads.
+	readBufSize = 32 * 1024
+
+	// MaxBulkStringLength and MaxArrayLength bound a single client frame before
+	// any payload or array allocation. They prevent malformed length prefixes
+	// from turning into process-wide memory exhaustion.
+	MaxBulkStringLength int64 = 64 * 1024 * 1024
+	MaxArrayLength      int64 = 1_000_000
+)
 
 // bulkPool holds reusable byte slices for bulk string payloads.
 // Most Redis keys/values fit in 256 bytes; the pool avoids GC churn.
@@ -138,6 +149,9 @@ func (p *Parser) parseBulkString() (types.Value, error) {
 	if length == -1 {
 		return types.Value{Type: types.TypeBulkString, IsNull: true}, nil
 	}
+	if length < 0 || length > MaxBulkStringLength {
+		return types.Value{}, ErrInvalidLength
+	}
 
 	// Acquire a pooled buffer and resize it to hold payload + \r\n.
 	bp := bulkPool.Get().(*[]byte)
@@ -175,6 +189,9 @@ func (p *Parser) parseArray() (types.Value, error) {
 	}
 	if length == -1 {
 		return types.Value{Type: types.TypeArray, IsNull: true}, nil
+	}
+	if length < 0 || length > MaxArrayLength {
+		return types.Value{}, ErrInvalidLength
 	}
 
 	array := make([]types.Value, length)
@@ -216,16 +233,33 @@ func parseDecimal(b []byte) (int64, error) {
 	if i >= len(b) {
 		return 0, ErrInvalidSyntax
 	}
-	var n int64
+	var n uint64
+	limit := uint64(1<<63 - 1)
+	if neg {
+		// The negative range contains one additional value: MinInt64.
+		limit++
+	}
 	for ; i < len(b); i++ {
 		c := b[i]
 		if c < '0' || c > '9' {
 			return 0, ErrInvalidSyntax
 		}
-		n = n*10 + int64(c-'0')
+		digit := uint64(c - '0')
+		if n > (limit-digit)/10 {
+			return 0, ErrInvalidSyntax
+		}
+		n = n*10 + digit
 	}
 	if neg {
-		return -n, nil
+		if n == 1<<63 {
+			return -1 << 63, nil
+		}
+		return -int64(n), nil
 	}
-	return n, nil
+	return int64(n), nil
+}
+
+// Buffered returns the number of bytes currently buffered in the reader.
+func (p *Parser) Buffered() int {
+	return p.r.Buffered()
 }

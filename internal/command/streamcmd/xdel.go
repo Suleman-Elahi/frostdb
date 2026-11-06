@@ -17,6 +17,15 @@ func (c XDelCommand) Execute(ctx *context.Context, args []types.Value) types.Val
 	}
 
 	key := string(args[0].Str)
+	ids := make([]string, len(args)-1)
+	for i, arg := range args[1:] {
+		idStr := string(arg.Str)
+		if _, err := object.ParseStreamID(idStr); err != nil {
+			return types.NewError("ERR Invalid stream ID specified as stream command argument")
+		}
+		ids[i] = idStr
+	}
+
 	obj, ok := ctx.Engine.Get(key)
 	if !ok {
 		return types.NewInt(0)
@@ -26,11 +35,6 @@ func (c XDelCommand) Execute(ctx *context.Context, args []types.Value) types.Val
 	}
 
 	stream := obj.Value.(*object.Stream)
-	ids := make([]string, len(args)-1)
-	for i, arg := range args[1:] {
-		ids[i] = string(arg.Str)
-	}
-
 	deleted := stream.Delete(ids...)
 	return types.NewInt(int64(deleted))
 }

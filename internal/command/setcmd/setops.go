@@ -1,6 +1,7 @@
 package setcmd
 
 import (
+	"frostdb/internal/engine/keyevent"
 	"frostdb/internal/engine/object"
 	"frostdb/internal/kernel/context"
 	"frostdb/internal/resp/types"
@@ -233,6 +234,13 @@ func storeSet(ctx *context.Context, dest string, members map[string]struct{}) ty
 	for m := range members {
 		s.Add(m)
 	}
+	oldObj, existed := ctx.Engine.Get(dest)
 	ctx.Engine.Set(dest, &object.Object{Type: object.TypeSet, Value: s})
+	if existed && oldObj != nil {
+		ctx.Engine.NotifyKeyEvent(ctx.DB, uint32(keyevent.FlagOverwrite), "overwritten", dest)
+		if oldObj.Type != object.TypeSet {
+			ctx.Engine.NotifyKeyEvent(ctx.DB, uint32(keyevent.FlagTypeChanged), "type_changed", dest)
+		}
+	}
 	return types.NewInt(int64(len(members)))
 }

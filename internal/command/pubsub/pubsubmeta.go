@@ -3,6 +3,7 @@ package pubsub
 import (
 	"strings"
 
+	"frostdb/internal/engine/api"
 	"frostdb/internal/kernel/context"
 	"frostdb/internal/resp/types"
 )
@@ -19,6 +20,18 @@ func (c PubSubMetaCommand) Execute(ctx *context.Context, args []types.Value) typ
 
 	switch strings.ToUpper(string(args[0].Str)) {
 	case "CHANNELS":
+		pattern := ""
+		if len(args) > 1 {
+			pattern = string(args[1].Str)
+		}
+		if oomEng, ok := ctx.Engine.(api.PubSubOOMEngine); ok {
+			chs := oomEng.PubSubChannels(pattern, false)
+			out := make([]types.Value, len(chs))
+			for i, ch := range chs {
+				out[i] = types.NewString(ch)
+			}
+			return types.NewArray(out)
+		}
 		return types.RespEmptyArr
 	case "NUMSUB":
 		channels := make([]string, 0, len(args)-1)
@@ -35,11 +48,31 @@ func (c PubSubMetaCommand) Execute(ctx *context.Context, args []types.Value) typ
 	case "NUMPAT":
 		return types.NewInt(ctx.Engine.PubSubNumPat())
 	case "SHARDCHANNELS":
+		pattern := ""
+		if len(args) > 1 {
+			pattern = string(args[1].Str)
+		}
+		if oomEng, ok := ctx.Engine.(api.PubSubOOMEngine); ok {
+			chs := oomEng.PubSubChannels(pattern, true)
+			out := make([]types.Value, len(chs))
+			for i, ch := range chs {
+				out[i] = types.NewString(ch)
+			}
+			return types.NewArray(out)
+		}
 		return types.RespEmptyArr
 	case "SHARDNUMSUB":
-		out := make([]types.Value, 0, (len(args)-1)*2)
+		channels := make([]string, 0, len(args)-1)
+		shardKeys := make([]string, 0, len(args)-1)
 		for i := 1; i < len(args); i++ {
-			out = append(out, types.NewString(string(args[i].Str)), types.RespZero)
+			ch := string(args[i].Str)
+			channels = append(channels, ch)
+			shardKeys = append(shardKeys, "__shard:"+ch)
+		}
+		counts := ctx.Engine.PubSubNumSub(shardKeys)
+		out := make([]types.Value, 0, len(channels)*2)
+		for i, ch := range channels {
+			out = append(out, types.NewString(ch), types.NewInt(counts[i]))
 		}
 		return types.NewArray(out)
 	default:

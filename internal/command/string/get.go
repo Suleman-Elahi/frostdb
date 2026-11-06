@@ -1,6 +1,7 @@
 package str
 
 import (
+	"frostdb/internal/engine/object"
 	"frostdb/internal/kernel/context"
 	"frostdb/internal/resp/types"
 )
@@ -22,9 +23,8 @@ func (c GetCommand) Execute(ctx *context.Context, args []types.Value) types.Valu
 		return types.RespNil
 	}
 
-	// For Phase 1, assume everything is a string that we can cast
-	if strVal, ok := obj.Value.(string); ok {
-		return types.NewString(strVal)
+	if b, ok := object.StringBytes(obj); ok {
+		return types.NewBytes(b)
 	}
 
 	return types.NewError("WRONGTYPE Operation against a key holding the wrong kind of value")

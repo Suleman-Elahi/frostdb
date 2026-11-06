@@ -1,10 +1,6 @@
 package listcmd
 
 import (
-	"strconv"
-	"time"
-
-	"frostdb/internal/blocking"
 	"frostdb/internal/command/generic"
 	"frostdb/internal/engine/object"
 	"frostdb/internal/kernel/context"
@@ -25,11 +21,10 @@ func (c RPopLPushCommand) Execute(ctx *context.Context, args []types.Value) type
 	dest := string(args[1].Str)
 	v, sig := popRightPushLeft(ctx, source, dest, false)
 	if sig {
-		if ctx.ExecutingMulti {
-			ctx.DeferredSignals = append(ctx.DeferredSignals, source)
-		} else {
-			ctx.Engine.SignalKey(source)
-		}
+		ctx.SignalKey(source)
+	}
+	if v.IsNull {
+		ctx.SkipReplication = true
 	}
 	return v
 }
@@ -46,90 +41,45 @@ func (c BRPopLPushCommand) Execute(ctx *context.Context, args []types.Value) typ
 
 	source := string(args[0].Str)
 	dest := string(args[1].Str)
-	timeoutSecs, err := strconv.ParseFloat(string(args[2].Str), 64)
-	if err != nil || timeoutSecs < 0 {
-		return types.NewError("ERR timeout is not a float or out of range")
+	timeoutSecs, errVal := generic.ParseTimeout(args[2])
+	if errVal.Type == types.TypeError {
+		return errVal
 	}
 
 	if ctx.ExecutingMulti || ctx.InScript {
 		v, sig := popRightPushLeft(ctx, source, dest, false)
 		if sig {
-			ctx.DeferredSignals = append(ctx.DeferredSignals, source)
+			ctx.SignalKey(source)
+		}
+		if v.IsNull {
+			ctx.SkipReplication = true
+		} else if v.Type != types.TypeError {
+			ctx.ReplicateAs = [][]byte{[]byte("RPOPLPUSH"), []byte(source), []byte(dest)}
 		}
 		return v
 	}
 
-	var signalSource bool
-	defer func() {
-		if signalSource {
-			ctx.Engine.SignalKey(source)
+	tryPopPush := func() (types.Value, bool) {
+		v, sig := popRightPushLeft(ctx, source, dest, true)
+		if sig {
+			ctx.SignalKey(source)
 		}
-	}()
+		if v.IsNull {
+			return v, false
+		}
+		if v.Type != types.TypeError {
+			ctx.ReplicateAs = [][]byte{[]byte("RPOPLPUSH"), []byte(source), []byte(dest)}
+		} else {
+			ctx.SkipReplication = true
+		}
+		return v, true
+	}
 
-	if v, sig := popRightPushLeft(ctx, source, dest, true); !v.IsNull {
-		signalSource = sig
+	if v, ok := tryPopPush(); ok {
 		return v
 	}
 
-	waitCh, cleanup := ctx.Engine.Subscribe([]string{source})
-	defer cleanup()
-	blocking.Inc()
-	defer blocking.Dec()
-	generic.UpdateClientBlocked(ctx, true)
-	defer generic.UpdateClientBlocked(ctx, false)
-
-	unblockCh := make(chan generic.UnblockType, 1)
-	generic.RegisterClientUnblockCh(ctx.ClientID, unblockCh)
-	defer generic.UnregisterClientUnblockCh(ctx.ClientID)
-
-	var timeoutCh <-chan time.Time
-	if timeoutSecs > 0 {
-		timeoutCh = time.After(time.Duration(timeoutSecs * float64(time.Second)))
-	}
-
-	// Release the command lock before blocking.
-	if ctx.CmdMu != nil {
-		ctx.CmdMu.Unlock()
-	}
-	defer func() {
-		if ctx.CmdMu != nil {
-			ctx.CmdMu.Lock()
-		}
-	}()
-
-	for {
-		if v, sig := popRightPushLeft(ctx, source, dest, true); !v.IsNull {
-			signalSource = sig
-			return v
-		}
-
-		select {
-		case <-waitCh:
-			if v, sig := popRightPushLeft(ctx, source, dest, true); !v.IsNull {
-				signalSource = sig
-				return v
-			}
-		case <-timeoutCh:
-			if ctx.Protocol >= 3 {
-				return types.NewNull()
-			}
-			return types.RespNil
-		case <-ctx.Done:
-			return types.RespNil
-		case <-blocking.StopSignal():
-			if ctx.Protocol >= 3 {
-				return types.NewNull()
-			}
-			return types.RespNil
-		case ut := <-unblockCh:
-			switch ut {
-			case generic.UnblockError:
-				return types.NewError("UNBLOCKED client unblocked via CLIENT UNBLOCK")
-			default:
-				return types.RespNil
-			}
-		}
-	}
+	return blockOnListKeys(ctx, []string{source}, timeoutSecs, tryPopPush)
 }
 
 // popRightPushLeft pops one element from source tail and pushes to destination head.
@@ -178,7 +128,7 @@ func popRightPushLeft(ctx *context.Context, source, dest string, returnNullSenti
 		if destObj.Type != object.TypeList {
 			// Restore val to source list to maintain order of elements after failure
 			sourceList.PushBack(val)
-			return types.NewError("WRONGTYPE Operation against a key holding the wrong kind of value"), true
+			return types.NewError("WRONGTYPE Operation against a key holding the wrong kind of value"), false
 		}
 		destList = destObj.Value.(*object.List)
 	} else {
@@ -200,10 +150,6 @@ func popRightPushLeft(ctx *context.Context, source, dest string, returnNullSenti
 	}
 
 	destList.PushFront(val)
-	if ctx.ExecutingMulti {
-		ctx.DeferredSignals = append(ctx.DeferredSignals, dest)
-	} else {
-		ctx.Engine.SignalKey(dest)
-	}
+	ctx.SignalKey(dest)
 	return types.NewString(string(val)), sig
 }

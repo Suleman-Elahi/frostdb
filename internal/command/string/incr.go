@@ -74,12 +74,12 @@ func incrBy(ctx *context.Context, keyBytes []byte, delta int64) types.Value {
 
 	obj, ok := ctx.Engine.GetBytes(keyBytes)
 	if ok {
-		strVal, isStr := obj.Value.(string)
+		strVal, isStr := obj.Value.([]byte)
 		if !isStr {
 			return types.NewError("WRONGTYPE Operation against a key holding the wrong kind of value")
 		}
 		var err error
-		current, err = strconv.ParseInt(strVal, 10, 64)
+		current, err = strconv.ParseInt(string(strVal), 10, 64)
 		if err != nil {
 			return types.NewError("ERR value is not an integer or out of range")
 		}

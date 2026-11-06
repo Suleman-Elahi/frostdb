@@ -19,19 +19,46 @@ func nowMs() int64 {
 	return time.Now().UnixMilli()
 }
 
+// SignalAck is sent back from a woken waiter to the signaler once the waiter
+// finishes attempting to consume from the signaled key.
+type SignalAck struct {
+	Consumed bool
+	Cascaded []string
+}
+
+// Waiter represents a client blocked on one or more keys.
+type Waiter struct {
+	WakeCh chan chan SignalAck
+	DoneCh chan struct{}
+	once   sync.Once
+}
+
+func NewWaiter() *Waiter {
+	return &Waiter{
+		WakeCh: make(chan chan SignalAck),
+		DoneCh: make(chan struct{}),
+	}
+}
+
+func (w *Waiter) CloseDone() {
+	w.once.Do(func() {
+		close(w.DoneCh)
+	})
+}
+
 // Shard holds a subset of the keyspace.
 // The mu RWMutex allows concurrent reads; writes are exclusive.
-// waiters is accessed under mu.Lock (write lock) only.
+// waiters is accessed under mu.Lock (write lock) or mu.RLock (snapshot).
 type Shard struct {
 	mu      sync.RWMutex
 	data    map[string]*object.Object
-	waiters map[string][]chan struct{}
+	waiters map[string][]*Waiter
 }
 
 func New() *Shard {
 	return &Shard{
 		data:    make(map[string]*object.Object),
-		waiters: make(map[string][]chan struct{}),
+		waiters: make(map[string][]*Waiter),
 	}
 }
 
@@ -105,21 +132,28 @@ func (s *Shard) Del(key string) bool {
 	return ok
 }
 
-func (s *Shard) Subscribe(key string, ch chan struct{}) {
+func (s *Shard) HasKey(key string) bool {
+	s.mu.RLock()
+	_, ok := s.data[key]
+	s.mu.RUnlock()
+	return ok
+}
+
+func (s *Shard) SubscribeWaiter(key string, w *Waiter) {
 	s.mu.Lock()
-	s.waiters[key] = append(s.waiters[key], ch)
+	s.waiters[key] = append(s.waiters[key], w)
 	s.mu.Unlock()
 }
 
-func (s *Shard) Unsubscribe(key string, ch chan struct{}) {
+func (s *Shard) UnsubscribeWaiter(key string, w *Waiter) {
 	s.mu.Lock()
 	ws := s.waiters[key]
 	n := 0
-	for _, w := range ws {
-		if w == ch {
+	for _, cur := range ws {
+		if cur == w {
 			continue
 		}
-		ws[n] = w
+		ws[n] = cur
 		n++
 	}
 	for i := n; i < len(ws); i++ {
@@ -133,35 +167,37 @@ func (s *Shard) Unsubscribe(key string, ch chan struct{}) {
 	s.mu.Unlock()
 }
 
-func (s *Shard) Signal(key string) {
-	s.mu.Lock()
-	for _, ch := range s.waiters[key] {
-		select {
-		case ch <- struct{}{}:
-			s.mu.Unlock()
-			return
-		default:
-		}
+func (s *Shard) WaitersSnapshot(key string) []*Waiter {
+	s.mu.RLock()
+	ws := s.waiters[key]
+	if len(ws) == 0 {
+		s.mu.RUnlock()
+		return nil
 	}
-	s.mu.Unlock()
+	cp := make([]*Waiter, len(ws))
+	copy(cp, ws)
+	s.mu.RUnlock()
+	return cp
 }
 
-// SignalAllBlocked signals all blocked clients on this shard, waking them
-// up so they can re-evaluate whether their waited-for keys now have data.
-// Used by SWAPDB and other operations that may change key availability.
-func (s *Shard) SignalAllBlocked() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for key, chs := range s.waiters {
-		for _, ch := range chs {
-			select {
-			case ch <- struct{}{}:
-			default:
-			}
-		}
-		// Clear waiters for this key so clients re-subscribe if needed
-		delete(s.waiters, key)
+func (s *Shard) WaiterKeys() []string {
+	s.mu.RLock()
+	if len(s.waiters) == 0 {
+		s.mu.RUnlock()
+		return nil
 	}
+	keys := make([]string, 0, len(s.waiters))
+	for k, ws := range s.waiters {
+		if len(ws) > 0 {
+			keys = append(keys, k)
+		}
+	}
+	s.mu.RUnlock()
+	return keys
+}
+
+func (s *Shard) SwapData(other *Shard) {
+	s.data, other.data = other.data, s.data
 }
 
 // Keys returns all non-expired keys in the shard.
@@ -187,6 +223,23 @@ func (s *Shard) KeysAll() []string {
 		keys = append(keys, k)
 	}
 	s.mu.RUnlock()
+	return keys
+}
+
+// SampleKeys returns up to n keys randomly sampled from the shard.
+func (s *Shard) SampleKeys(n int) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.data) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, n)
+	for k := range s.data {
+		keys = append(keys, k)
+		if len(keys) >= n {
+			break
+		}
+	}
 	return keys
 }
 
@@ -250,6 +303,6 @@ func (s *Shard) UnlockForSwap() { s.mu.Unlock() }
 func (s *Shard) Flush() {
 	s.mu.Lock()
 	s.data = make(map[string]*object.Object)
-	s.waiters = make(map[string][]chan struct{})
+	s.waiters = make(map[string][]*Waiter)
 	s.mu.Unlock()
 }

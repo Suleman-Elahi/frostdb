@@ -1,10 +1,14 @@
 package generic
 
-import "sync/atomic"
+import (
+	"sync/atomic"
 
-var listMaxListpackSize atomic.Int64
-var listCompressDepth atomic.Int64
-var debugQuicklistPackedThresholdBytes atomic.Int64
+	"frostdb/internal/engine/object"
+)
+
+var listMaxListpackSize = &object.ListMaxListpackSize
+var listCompressDepth = &object.ListCompressDepth
+var debugQuicklistPackedThresholdBytes = &object.QuicklistPackedThresholdBytes
 
 var setMaxIntsetEntries atomic.Int64
 var setMaxListpackEntries atomic.Int64

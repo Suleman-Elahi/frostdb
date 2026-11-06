@@ -32,11 +32,11 @@ func (c IncrByFloatCommand) Execute(ctx *context.Context, args []types.Value) ty
 	var current float64
 	obj, ok := ctx.Engine.GetBytes(args[0].Str)
 	if ok {
-		strVal, isStr := obj.Value.(string)
+		strVal, isStr := obj.Value.([]byte)
 		if !isStr {
 			return types.NewError("WRONGTYPE Operation against a key holding the wrong kind of value")
 		}
-		current, err = strconv.ParseFloat(strVal, 64)
+		current, err = strconv.ParseFloat(string(strVal), 64)
 		if err != nil {
 			return types.NewError("ERR value is not a valid float")
 		}

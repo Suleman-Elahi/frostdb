@@ -33,6 +33,33 @@ type Object struct {
 	LastAccess uint32 // LRU: 24-bit clock. LFU: 16-bit decaytime | 8-bit counter
 }
 
+// StringBytes returns a read-only byte view of a binary-safe string object.
+// Callers must never mutate the returned slice — Object.Value for TypeString
+// is stored as an immutable-by-convention []byte owned by the Object.
+func StringBytes(o *Object) ([]byte, bool) {
+	if o == nil || o.Type != TypeString {
+		return nil, false
+	}
+	if v, ok := o.Value.([]byte); ok {
+		return v, true
+	}
+	return nil, false
+}
+
+// StringValue returns the string stored in a string object. This allocates
+// because a Go string must own an immutable copy of the bytes. Prefer
+// StringBytes on hot paths (GET, MGET, ...) where the RESP encoder can
+// consume a []byte directly without allocating.
+func StringValue(o *Object) (string, bool) {
+	if o == nil || o.Type != TypeString {
+		return "", false
+	}
+	if v, ok := o.Value.([]byte); ok {
+		return string(v), true
+	}
+	return "", false
+}
+
 // DeepCopy creates a deep copy of the object.
 func (o *Object) DeepCopy() *Object {
 	cp := &Object{
@@ -45,14 +72,22 @@ func (o *Object) DeepCopy() *Object {
 
 	switch o.Type {
 	case TypeString:
-		// Strings are immutable in Go, safe to share
-		cp.Value = o.Value
+		switch v := o.Value.(type) {
+		case []byte:
+			// Defensive copy: []byte is mutable, so COPY/DEBUG RELOAD-style
+			// duplication must not let the two Objects alias the same
+			// backing array.
+			cp.Value = append([]byte(nil), v...)
+		default:
+			cp.Value = o.Value
+		}
 	case TypeList:
 		src := o.Value.(*List)
 		dst := NewList()
 		for _, val := range src.Snapshot() {
 			dst.PushBack(val)
 		}
+		dst.Quicklist = src.IsQuicklist()
 		cp.Value = dst
 	case TypeHash:
 		src := o.Value.(*Hash)
@@ -78,10 +113,16 @@ func (o *Object) DeepCopy() *Object {
 		}
 		cp.Value = dst
 	case TypeStream:
-		// Streams are complex — share reference (COPY on streams is rare)
-		cp.Value = o.Value
+		src := o.Value.(*Stream)
+		cp.Value = StreamFromSnapshot(src.Snapshot())
 	case TypeArray:
-		// Arrays are safe to share reference for COPY
+		src := o.Value.(*Array)
+		if b, err := src.MarshalJSON(); err == nil {
+			if dst, err := ParseArrayJSON(b); err == nil {
+				cp.Value = dst
+				break
+			}
+		}
 		cp.Value = o.Value
 	default:
 		cp.Value = o.Value

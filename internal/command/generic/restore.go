@@ -117,12 +117,14 @@ func (c RestoreCommand) Execute(ctx *context.Context, args []types.Value) types.
 			if oldObj.Type != obj.Type {
 				ctx.Engine.NotifyKeyEvent(ctx.DB, uint32(keyevent.FlagTypeChanged), "type_changed", key)
 			}
+			ctx.SignalKey(key)
 			return types.RespOK
 		}
 		ctx.Engine.Del(key)
 	}
 	ctx.Engine.Set(key, obj)
 	ctx.Engine.NotifyKeyEvent(ctx.DB, uint32(keyevent.FlagGeneric), "restore", key)
+	ctx.SignalKey(key)
 	return types.RespOK
 }
 
@@ -131,9 +133,11 @@ func convertParsedObject(o parser.RedisObject) *object.Object {
 	switch o.GetType() {
 	case parser.StringType:
 		str := o.(*parser.StringObject)
+		// Defensive copy — see rdb.go's convertObject for rationale (vendored
+		// decoder buffer-reuse guarantees not audited for this migration).
 		return &object.Object{
 			Type:  object.TypeString,
-			Value: string(str.Value),
+			Value: append([]byte(nil), str.Value...),
 		}
 	case parser.ListType:
 		list := o.(*parser.ListObject)
@@ -141,6 +145,7 @@ func convertParsedObject(o parser.RedisObject) *object.Object {
 		for _, val := range list.Values {
 			l.PushBack(val)
 		}
+		l.RecomputeEncodingAuto()
 		return &object.Object{
 			Type:  object.TypeList,
 			Value: l,

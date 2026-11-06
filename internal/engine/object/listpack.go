@@ -42,10 +42,15 @@ func (n *StreamNode) Append(entry StreamEntry) bool {
 	if maxEntries > 0 && int64(n.Count) >= maxEntries {
 		return false
 	}
-	if len(n.Data) > 4096 && n.Count > 0 {
+	if maxEntries <= 0 && len(n.Data) > 4096 && n.Count > 0 {
 		return false
 	}
+	n.AppendRaw(entry)
+	return true
+}
 
+// AppendRaw encodes and appends a StreamEntry unconditionally without checking node capacity.
+func (n *StreamNode) AppendRaw(entry StreamEntry) {
 	var header [18]byte
 	binary.BigEndian.PutUint64(header[0:8], uint64(entry.ID.MS))
 	binary.BigEndian.PutUint64(header[8:16], uint64(entry.ID.Seq))
@@ -58,21 +63,20 @@ func (n *StreamNode) Append(entry StreamEntry) bool {
 	
 	n.Data = append(n.Data, header[:]...)
 
-	var lenBuf [2]byte
+	var lenBuf [4]byte
 	for i := 0; i < fieldsLen; i++ {
 		f := entry.Fields[i]
 		
-		binary.BigEndian.PutUint16(lenBuf[:], uint16(len(f.Name)))
+		binary.BigEndian.PutUint32(lenBuf[:], uint32(len(f.Name)))
 		n.Data = append(n.Data, lenBuf[:]...)
 		n.Data = append(n.Data, f.Name...)
 
-		binary.BigEndian.PutUint16(lenBuf[:], uint16(len(f.Value)))
+		binary.BigEndian.PutUint32(lenBuf[:], uint32(len(f.Value)))
 		n.Data = append(n.Data, lenBuf[:]...)
 		n.Data = append(n.Data, f.Value...)
 	}
 
 	n.Count++
-	return true
 }
 
 // Iterator for StreamNode
@@ -103,13 +107,13 @@ func (it *StreamNodeIterator) Next() StreamEntry {
 
 	fields := make([]StreamField, fieldsLen)
 	for i := 0; i < fieldsLen; i++ {
-		nameLen := int(binary.BigEndian.Uint16(data[it.offset : it.offset+2]))
-		it.offset += 2
+		nameLen := int(binary.BigEndian.Uint32(data[it.offset : it.offset+4]))
+		it.offset += 4
 		name := string(data[it.offset : it.offset+nameLen])
 		it.offset += nameLen
 
-		valLen := int(binary.BigEndian.Uint16(data[it.offset : it.offset+2]))
-		it.offset += 2
+		valLen := int(binary.BigEndian.Uint32(data[it.offset : it.offset+4]))
+		it.offset += 4
 		val := string(data[it.offset : it.offset+valLen])
 		it.offset += valLen
 
@@ -126,6 +130,15 @@ func (it *StreamNodeIterator) Next() StreamEntry {
 // Len returns the number of entries in this node.
 func (n *StreamNode) Len() int {
 	return int(n.Count)
+}
+
+// FirstEntry returns the first entry in this node.
+func (n *StreamNode) FirstEntry() StreamEntry {
+	it := n.Iterator()
+	if it.HasNext() {
+		return it.Next()
+	}
+	return StreamEntry{}
 }
 
 // LastEntry returns the last entry in this node.

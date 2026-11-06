@@ -1,9 +1,11 @@
 package rdb
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/hdt3213/rdb/encoder"
 	"github.com/hdt3213/rdb/model"
@@ -14,34 +16,75 @@ import (
 
 // Exporter dumps FrostDB state as an RDB file.
 type Exporter struct {
-	shards [256]*shard.Shard
-	writer io.Writer
+	databases [][256]*shard.Shard
+	writer    io.Writer
 }
 
-// NewExporter creates an exporter from the given shards.
+// NewExporter creates an exporter for one database, retaining the original API.
 func NewExporter(shards [256]*shard.Shard) *Exporter {
-	return &Exporter{shards: shards}
+	return NewMultiExporter([][256]*shard.Shard{shards})
 }
 
-// NewExporterToWriter creates an exporter that writes to the given writer.
-func NewExporterToWriter(shards [256]*shard.Shard, w io.Writer) *Exporter {
-	return &Exporter{shards: shards, writer: w}
+// NewMultiExporter creates an exporter that writes every supplied logical DB.
+func NewMultiExporter(databases [][256]*shard.Shard) *Exporter {
+	return &Exporter{databases: databases}
 }
 
-// ExportFile writes the current state to an RDB file at the given path.
-// Returns the number of keys exported.
+// NewExporterToWriter creates a single-database exporter for a writer.
+func NewExporterToWriter(shards [256]*shard.Shard, writer io.Writer) *Exporter {
+	return NewMultiExporterToWriter([][256]*shard.Shard{shards}, writer)
+}
+
+// NewMultiExporterToWriter creates a multi-database exporter for a writer.
+func NewMultiExporterToWriter(databases [][256]*shard.Shard, writer io.Writer) *Exporter {
+	return &Exporter{databases: databases, writer: writer}
+}
+
+// ExportFile atomically writes the current state to an RDB file.
 func (exp *Exporter) ExportFile(path string) (int, error) {
-	f, err := os.Create(path)
+	dir := filepath.Dir(path)
+	file, err := os.CreateTemp(dir, ".dump-*.rdb.tmp")
 	if err != nil {
-		return 0, fmt.Errorf("rdb export: create: %w", err)
+		return 0, fmt.Errorf("rdb export: create temporary file: %w", err)
 	}
-	defer f.Close()
-	exp.writer = f
-	return exp.Export()
+	tempPath := file.Name()
+	exp.writer = file
+
+	count, exportErr := exp.Export()
+	if exportErr != nil {
+		_ = file.Close()
+		_ = os.Remove(tempPath)
+		return count, exportErr
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		_ = os.Remove(tempPath)
+		return count, fmt.Errorf("rdb export: fsync: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(tempPath)
+		return count, fmt.Errorf("rdb export: close: %w", err)
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		_ = os.Remove(tempPath)
+		return count, fmt.Errorf("rdb export: publish: %w", err)
+	}
+	if err := syncDirectory(dir); err != nil {
+		return count, fmt.Errorf("rdb export: sync directory: %w", err)
+	}
+	return count, nil
+}
+
+func syncDirectory(dir string) error {
+	directory, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return directory.Sync()
 }
 
 // Export writes RDB data to the configured writer.
-// Returns the number of keys exported.
 func (exp *Exporter) Export() (int, error) {
 	if exp.writer == nil {
 		return 0, fmt.Errorf("rdb export: no writer configured")
@@ -51,46 +94,33 @@ func (exp *Exporter) Export() (int, error) {
 	if err := enc.WriteHeader(); err != nil {
 		return 0, fmt.Errorf("rdb export: header: %w", err)
 	}
-
-	// Write aux fields
 	enc.WriteAux("redis-ver", "7.0.0")
 	enc.WriteAux("redis-bits", "64")
 	enc.WriteAux("aof-preamble", "0")
 
-	// Count total keys for DB header
-	totalKeys := 0
-	totalExpires := 0
-	for i := 0; i < 256; i++ {
-		exp.shards[i].ForEach(func(key string, obj *object.Object) {
-			totalKeys++
-			if obj.ExpireAt > 0 {
-				totalExpires++
-			}
-		})
-	}
-
-	// Only write DB header if there are keys
-	if totalKeys > 0 {
-		if err := enc.WriteDBHeader(0, uint64(totalKeys), uint64(totalExpires)); err != nil {
-			return 0, fmt.Errorf("rdb export: db header: %w", err)
-		}
-	}
-
 	count := 0
-	var writeErr error
-
-	for i := 0; i < 256; i++ {
-		exp.shards[i].ForEach(func(key string, obj *object.Object) {
+	for dbIndex, shards := range exp.databases {
+		keys, expires := countKeys(shards)
+		if keys == 0 {
+			continue
+		}
+		if err := enc.WriteDBHeader(uint(dbIndex), uint64(keys), uint64(expires)); err != nil {
+			return count, fmt.Errorf("rdb export: db %d header: %w", dbIndex, err)
+		}
+		for shardIndex := 0; shardIndex < len(shards); shardIndex++ {
+			var writeErr error
+			shards[shardIndex].ForEach(func(key string, obj *object.Object) {
+				if writeErr != nil {
+					return
+				}
+				writeErr = exp.writeObject(enc, key, obj)
+				if writeErr == nil {
+					count++
+				}
+			})
 			if writeErr != nil {
-				return
+				return count, writeErr
 			}
-			writeErr = exp.writeObject(enc, key, obj)
-			if writeErr == nil {
-				count++
-			}
-		})
-		if writeErr != nil {
-			return count, writeErr
 		}
 	}
 
@@ -100,79 +130,76 @@ func (exp *Exporter) Export() (int, error) {
 	return count, nil
 }
 
+func countKeys(shards [256]*shard.Shard) (keys, expires int) {
+	for i := 0; i < len(shards); i++ {
+		shards[i].ForEach(func(_ string, obj *object.Object) {
+			keys++
+			if obj.ExpireAt > 0 {
+				expires++
+			}
+		})
+	}
+	return keys, expires
+}
+
 func (exp *Exporter) writeObject(enc *encoder.Encoder, key string, obj *object.Object) error {
 	opts := exp.ttlOpts(obj)
-
 	switch obj.Type {
 	case object.TypeString:
-		val, ok := obj.Value.(string)
+		value, ok := obj.Value.([]byte)
 		if !ok {
 			return nil
 		}
-		return enc.WriteStringObject(key, []byte(val), opts...)
-
+		return enc.WriteStringObject(key, value, opts...)
 	case object.TypeList:
-		l, ok := obj.Value.(*object.List)
+		value, ok := obj.Value.(*object.List)
 		if !ok {
 			return nil
 		}
-		values := l.Snapshot()
-		return enc.WriteListObject(key, values, opts...)
-
+		return enc.WriteListObject(key, value.Snapshot(), opts...)
 	case object.TypeSet:
-		s, ok := obj.Value.(*object.Set)
+		value, ok := obj.Value.(*object.Set)
 		if !ok {
 			return nil
 		}
-		members := s.Members()
+		members := value.Members()
 		data := make([][]byte, len(members))
-		for i, m := range members {
-			data[i] = []byte(m)
+		for i, member := range members {
+			data[i] = []byte(member)
 		}
 		return enc.WriteSetObject(key, data, opts...)
-
 	case object.TypeHash:
-		h, ok := obj.Value.(*object.Hash)
+		value, ok := obj.Value.(*object.Hash)
 		if !ok {
 			return nil
 		}
-		hashMap := make(map[string][]byte, h.Len())
-		for field, val := range h.GetAll() {
-			hashMap[field] = []byte(val)
+		hash := make(map[string][]byte, value.Len())
+		for field, item := range value.GetAll() {
+			hash[field] = []byte(item)
 		}
-		return enc.WriteHashMapObject(key, hashMap, opts...)
-
+		return enc.WriteHashMapObject(key, hash, opts...)
 	case object.TypeZSet:
-		z, ok := obj.Value.(*object.ZSet)
+		value, ok := obj.Value.(*object.ZSet)
 		if !ok {
 			return nil
 		}
-		entries := make([]*model.ZSetEntry, 0, z.Len())
-		node := z.Skiplist.Head.Level[0].Forward
-		for node != nil {
-			entries = append(entries, &model.ZSetEntry{
-				Score:  node.Score,
-				Member: node.Member,
-			})
-			node = node.Level[0].Forward
+		entries := make([]*model.ZSetEntry, 0, value.Len())
+		for node := value.Skiplist.Head.Level[0].Forward; node != nil; node = node.Level[0].Forward {
+			entries = append(entries, &model.ZSetEntry{Score: node.Score, Member: node.Member})
 		}
 		return enc.WriteZSetObject(key, entries, opts...)
-
 	case object.TypeStream:
-		s, ok := obj.Value.(*object.Stream)
+		value, ok := obj.Value.(*object.Stream)
 		if !ok {
 			return nil
 		}
-		return exp.writeStream(enc, key, s, opts...)
-
+		return exp.writeStream(enc, key, value, opts...)
 	case object.TypeArray:
-		arr, ok := obj.Value.(*object.Array)
+		value, ok := obj.Value.(*object.Array)
 		if !ok {
 			return nil
 		}
-		hashMap := arr.ToRDBHash()
-		return enc.WriteHashMapObject(key, hashMap, opts...)
-
+		return enc.WriteHashMapObject(key, value.ToRDBHash(), opts...)
 	default:
 		return nil
 	}
@@ -185,79 +212,23 @@ func (exp *Exporter) ttlOpts(obj *object.Object) []interface{} {
 	return nil
 }
 
-func (exp *Exporter) writeStream(enc *encoder.Encoder, key string, s *object.Stream, opts ...interface{}) error {
-	// Build a model.StreamObject for the encoder
-	so := &model.StreamObject{}
+const streamSnapshotGroupPrefix = "__frostdb_stream_snapshot__:"
 
-	// Collect all entries
-	var entries []*model.StreamEntry
-	s.Blocks.Ascend(func(b object.StreamBlock) bool {
-		it := b.Node.Iterator()
-		streamEntry := &model.StreamEntry{
-			FirstMsgId: &model.StreamId{Ms: uint64(b.FirstID.MS), Sequence: uint64(b.FirstID.Seq)},
-		}
-		for it.HasNext() {
-			entry := it.Next()
-			msg := &model.StreamMessage{
-				Id:     &model.StreamId{Ms: uint64(entry.ID.MS), Sequence: uint64(entry.ID.Seq)},
-				Fields: make(map[string]string, len(entry.Fields)),
-			}
-			for _, f := range entry.Fields {
-				msg.Fields[f.Name] = f.Value
-			}
-			streamEntry.Msgs = append(streamEntry.Msgs, msg)
-		}
-		entries = append(entries, streamEntry)
-		return true
-	})
-	so.Entries = entries
-	so.Length = uint64(s.Len())
-
-	// Last ID
-	if s.Blocks.Len() > 0 {
-		lastBlock, _ := s.Blocks.Max()
-		it := lastBlock.Node.Iterator()
-		var lastEntry object.StreamEntry
-		for it.HasNext() {
-			lastEntry = it.Next()
-		}
-		so.LastId = &model.StreamId{Ms: uint64(lastEntry.ID.MS), Sequence: uint64(lastEntry.ID.Seq)}
-		// FirstId
-		firstBlock, _ := s.Blocks.Min()
-		firstIt := firstBlock.Node.Iterator()
-		if firstIt.HasNext() {
-			first := firstIt.Next()
-			so.FirstId = &model.StreamId{Ms: uint64(first.ID.MS), Sequence: uint64(first.ID.Seq)}
-		}
+func (exp *Exporter) writeStream(enc *encoder.Encoder, key string, stream *object.Stream, opts ...interface{}) error {
+	lastID := stream.LastGeneratedStreamID()
+	snapJSON, err := json.Marshal(stream.Snapshot())
+	if err != nil {
+		return err
 	}
-
-	// Groups
-	for _, g := range s.Groups {
-		sg := &model.StreamGroup{
-			Name:   g.Name,
-			LastId: &model.StreamId{Ms: uint64(g.LastDeliveredID.MS), Sequence: uint64(g.LastDeliveredID.Seq)},
-		}
-		for id, pe := range g.Pending {
-			sg.Pending = append(sg.Pending, &model.StreamNAck{
-				Id:            &model.StreamId{Ms: uint64(id.MS), Sequence: uint64(id.Seq)},
-				DeliveryTime:  uint64(pe.LastDeliveryMs),
-				DeliveryCount: uint64(pe.DeliveryCount),
-			})
-		}
-		// Build consumers from pending entries
-		consumerPending := make(map[string][]*model.StreamId)
-		for id, pe := range g.Pending {
-			consumerPending[pe.Consumer] = append(consumerPending[pe.Consumer],
-				&model.StreamId{Ms: uint64(id.MS), Sequence: uint64(id.Seq)})
-		}
-		for name, pids := range consumerPending {
-			sg.Consumers = append(sg.Consumers, &model.StreamConsumer{
-				Name:    name,
-				Pending: pids,
-			})
-		}
-		so.Groups = append(so.Groups, sg)
+	streamObject := &model.StreamObject{
+		Length: uint64(stream.Len()),
+		LastId: &model.StreamId{Ms: lastID.MS, Sequence: lastID.Seq},
+		Groups: []*model.StreamGroup{
+			{
+				Name:   streamSnapshotGroupPrefix + string(snapJSON),
+				LastId: &model.StreamId{},
+			},
+		},
 	}
-
-	return enc.WriteStreamObject(key, so, opts...)
+	return enc.WriteStreamObject(key, streamObject, opts...)
 }

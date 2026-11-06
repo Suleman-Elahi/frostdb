@@ -56,10 +56,6 @@ func (c XSetIDCommand) Execute(ctx *context.Context, args []types.Value) types.V
 			if idx+1 >= len(args) {
 				return types.NewError("ERR syntax error")
 			}
-			// MAXDELETEDID requires ENTRIESADDED to be specified first
-			if !hasEntriesAdded {
-				return types.NewError("ERR syntax error, ENTRIESADDED must be specified before MAXDELETEDID")
-			}
 			parsedID, err := object.ParseStreamID(string(args[idx+1].Str))
 			if err != nil {
 				return types.NewError("ERR Invalid stream ID specified as stream command argument")
@@ -72,14 +68,6 @@ func (c XSetIDCommand) Execute(ctx *context.Context, args []types.Value) types.V
 		}
 	}
 
-	// Validate: if MAXDELETEDID is specified, ENTRIESADDED must also be specified
-	if hasMaxDeletedID && !hasEntriesAdded {
-		return types.NewError("ERR syntax error, ENTRIESADDED must be specified before MAXDELETEDID")
-	}
-
-	// Validate: if ENTRIESADDED is specified without MAXDELETEDID, that's allowed
-	// But if only MAXDELETEDID without ENTRIESADDED, it's a syntax error (handled above during parsing)
-
 	// NOW check key existence (after syntax validation)
 	obj, ok := ctx.Engine.Get(key)
 	if !ok {
@@ -91,10 +79,10 @@ func (c XSetIDCommand) Execute(ctx *context.Context, args []types.Value) types.V
 
 	stream := obj.Value.(*object.Stream)
 
-	// Validate MAXDELETEDID must be smaller than the new last-id
+	// Validate MAXDELETEDID must not be greater than the new last-id
 	if maxDeletedID != nil {
-		if maxDeletedID.Compare(lastID) >= 0 {
-			return types.NewError("ERR The MAXDELETEDID specified is smaller or equal to the new LASTID")
+		if maxDeletedID.Compare(lastID) > 0 {
+			return types.NewError("ERR The ID specified in XSETID is smaller than the provided max_deleted_entry_id")
 		}
 	}
 

@@ -1,12 +1,13 @@
 package listcmd
 
 import (
-	"strconv"
 	"time"
 
 	"frostdb/internal/blocking"
 	"frostdb/internal/command/generic"
+	"frostdb/internal/engine/api"
 	"frostdb/internal/engine/object"
+	"frostdb/internal/engine/shard"
 	"frostdb/internal/kernel/context"
 	"frostdb/internal/resp/types"
 )
@@ -32,102 +33,32 @@ func (c BPopCommand) Execute(ctx *context.Context, args []types.Value) types.Val
 		keys = append(keys, string(args[i].Str))
 	}
 
-	timeoutSecs, err := strconv.ParseFloat(string(args[len(args)-1].Str), 64)
-	if err != nil || timeoutSecs < 0 {
-		return types.NewError("ERR timeout is not a float or out of range")
+	timeoutSecs, errVal := generic.ParseTimeout(args[len(args)-1])
+	if errVal.Type == types.TypeError {
+		return errVal
 	}
 
 	if ctx.ExecutingMulti || ctx.InScript {
 		val := c.tryPop(ctx, keys, false)
 		if val.IsNull {
+			ctx.SkipReplication = true
 			if ctx.Protocol >= 3 {
 				return types.NewNull()
 			}
 			return types.RespNil
 		}
-		for _, k := range keys {
-			if obj, ok := ctx.Engine.GetCheckExpired(k); ok && obj.Type == object.TypeList {
-				if obj.Value.(*object.List).LLen() > 0 {
-					ctx.DeferredSignals = append(ctx.DeferredSignals, k)
-				}
-			}
-		}
 		return val
 	}
-
-	defer func() {
-		for _, k := range keys {
-			if obj, ok := ctx.Engine.GetCheckExpired(k); ok && obj.Type == object.TypeList {
-				if obj.Value.(*object.List).LLen() > 0 {
-					ctx.Engine.SignalKey(k)
-				}
-			}
-		}
-	}()
 
 	// Try popping first (strict: wrong type should error immediately).
 	if val := c.tryPop(ctx, keys, false); !val.IsNull {
 		return val
 	}
 
-	// Subscribe
-	waitCh, cleanup := ctx.Engine.Subscribe(keys)
-	defer cleanup()
-	blocking.Inc()
-	defer blocking.Dec()
-	generic.UpdateClientBlocked(ctx, true)
-	defer generic.UpdateClientBlocked(ctx, false)
-
-	unblockCh := make(chan generic.UnblockType, 1)
-	generic.RegisterClientUnblockCh(ctx.ClientID, unblockCh)
-	defer generic.UnregisterClientUnblockCh(ctx.ClientID)
-
-	var timeoutCh <-chan time.Time
-	if timeoutSecs > 0 {
-		timeoutCh = time.After(time.Duration(timeoutSecs * float64(time.Second)))
-	}
-
-	// Wait loop — release the command lock so other connections can
-	// execute LPUSH/RPUSH that will unblock us.
-	if ctx.CmdMu != nil {
-		ctx.CmdMu.Unlock()
-	}
-	defer func() {
-		if ctx.CmdMu != nil {
-			ctx.CmdMu.Lock()
-		}
-	}()
-
-	for {
-		// Double-check just in case something was pushed before we subscribed
-		if val := c.tryPop(ctx, keys, true); !val.IsNull {
-			return val
-		}
-
-		select {
-		case <-waitCh:
-			if val := c.tryPop(ctx, keys, true); !val.IsNull {
-				return val
-			}
-			// Spurious wakeup or someone else grabbed it, loop back and wait
-		case <-timeoutCh:
-			return types.RespNil
-		case <-ctx.Done:
-			return types.RespNil
-		case <-blocking.StopSignal():
-			if ctx.Protocol >= 3 {
-				return types.NewNull()
-			}
-			return types.RespNil
-		case ut := <-unblockCh:
-			switch ut {
-			case generic.UnblockError:
-				return types.NewError("UNBLOCKED client unblocked via CLIENT UNBLOCK")
-			default:
-				return types.RespNil
-			}
-		}
-	}
+	return blockOnListKeys(ctx, keys, timeoutSecs, func() (types.Value, bool) {
+		val := c.tryPop(ctx, keys, true)
+		return val, !val.IsNull
+	})
 }
 
 func (c BPopCommand) tryPop(ctx *context.Context, keys []string, ignoreWrongType bool) types.Value {
@@ -156,7 +87,14 @@ func (c BPopCommand) tryPop(ctx *context.Context, keys []string, ignoreWrongType
 		if popped {
 			if list.LLen() == 0 {
 				ctx.Engine.Del(key)
+			} else {
+				ctx.SignalKey(key)
 			}
+			popCmd := "LPOP"
+			if !c.IsLeft {
+				popCmd = "RPOP"
+			}
+			ctx.ReplicateAs = [][]byte{[]byte(popCmd), []byte(key)}
 			return types.NewArray([]types.Value{
 				types.NewString(key),
 				types.NewString(string(val)),
@@ -164,4 +102,150 @@ func (c BPopCommand) tryPop(ctx *context.Context, keys []string, ignoreWrongType
 		}
 	}
 	return types.RespNil
+}
+
+func blockOnListKeys(ctx *context.Context, keys []string, timeoutSecs float64, tryWakeFn func() (types.Value, bool)) types.Value {
+	var waiter *shard.Waiter
+	var legacyCh <-chan struct{}
+	var cleanup func()
+	if be, ok := ctx.Engine.(api.BlockingEngine); ok {
+		waiter, cleanup = be.SubscribeWaiter(keys)
+	} else {
+		legacyCh, cleanup = ctx.Engine.Subscribe(keys)
+	}
+
+	blocking.Inc()
+	generic.UpdateClientBlocked(ctx, true)
+	unblockCh := make(chan generic.UnblockType, 1)
+	generic.RegisterClientUnblockCh(ctx.ClientID, unblockCh)
+
+	blockedActive := true
+	finishBlocked := func(failed bool) {
+		if blockedActive {
+			blockedActive = false
+			if ctx.RecordStatsNow != nil {
+				ctx.RecordStatsNow(failed)
+			}
+			blocking.Dec()
+			generic.UpdateClientBlocked(ctx, false)
+			generic.UnregisterClientUnblockCh(ctx.ClientID)
+		}
+	}
+	defer func() {
+		finishBlocked(false)
+		cleanup()
+	}()
+
+	discCh, stopDisc := ctx.WatchDisconnect()
+	defer stopDisc()
+
+	var timeoutCh <-chan time.Time
+	if timeoutSecs > 0 {
+		timeoutCh = time.After(time.Duration(timeoutSecs * float64(time.Second)))
+	}
+
+	// Flush any buffered pipeline replies before blocking this connection.
+	if ctx.FlushWriter != nil {
+		ctx.FlushWriter()
+	}
+
+	// Release striped key locks while waiting so other connections can push.
+	if ctx.UnlockKeys != nil {
+		ctx.UnlockKeys()
+	}
+
+	var wakeCh <-chan chan shard.SignalAck
+	if waiter != nil {
+		wakeCh = waiter.WakeCh
+	}
+
+	for {
+		select {
+		case ackCh := <-wakeCh:
+			if ctx.LockKeys != nil {
+				ctx.LockKeys()
+			}
+			ctx.InWakeup = true
+			dirtyBefore := ctx.Engine.GetDirty()
+			val, ok := tryWakeFn()
+			dirtyAfter := ctx.Engine.GetDirty()
+			ctx.InWakeup = false
+			if ok {
+				failed := val.Type == types.TypeError
+				if !failed && !ctx.SkipReplication && len(ctx.ReplicateAs) > 0 {
+					if dirtyAfter == dirtyBefore {
+						ctx.Engine.AddDirty(1)
+					}
+					_ = ctx.Engine.LogCommand(ctx.ReplicateAs)
+					ctx.SkipReplication = true
+				} else {
+					ctx.SkipReplication = true
+				}
+				cascaded := ctx.TakeSignals()
+				finishBlocked(failed)
+				if ctx.UnlockKeys != nil {
+					ctx.UnlockKeys()
+				}
+				ackCh <- shard.SignalAck{
+					Consumed: true,
+					Cascaded: cascaded,
+				}
+				return val
+			}
+			if ctx.UnlockKeys != nil {
+				ctx.UnlockKeys()
+			}
+			ackCh <- shard.SignalAck{Consumed: false}
+
+		case <-legacyCh:
+			if ctx.LockKeys != nil {
+				ctx.LockKeys()
+			}
+			val, ok := tryWakeFn()
+			if ok {
+				failed := val.Type == types.TypeError
+				finishBlocked(failed)
+				if ctx.UnlockKeys != nil {
+					ctx.UnlockKeys()
+				}
+				return val
+			}
+			if ctx.UnlockKeys != nil {
+				ctx.UnlockKeys()
+			}
+
+		case <-timeoutCh:
+			ctx.SkipReplication = true
+			finishBlocked(false)
+			if ctx.Protocol >= 3 {
+				return types.NewNull()
+			}
+			return types.RespNil
+
+		case <-discCh:
+			ctx.SkipReplication = true
+			finishBlocked(false)
+			return types.RespNil
+
+		case <-blocking.StopSignal():
+			ctx.SkipReplication = true
+			finishBlocked(false)
+			if ctx.Protocol >= 3 {
+				return types.NewNull()
+			}
+			return types.RespNil
+
+		case ut := <-unblockCh:
+			ctx.SkipReplication = true
+			if ut == generic.UnblockError {
+				finishBlocked(true)
+				return types.NewError("UNBLOCKED client unblocked via CLIENT UNBLOCK")
+			}
+			finishBlocked(false)
+			if ctx.Protocol >= 3 {
+				return types.NewNull()
+			}
+			return types.RespNil
+		}
+	}
 }

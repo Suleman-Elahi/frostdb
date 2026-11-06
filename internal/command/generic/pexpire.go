@@ -24,6 +24,7 @@ func (c PExpireCommand) Execute(ctx *context.Context, args []types.Value) types.
 
 	obj, ok := ctx.Engine.GetBytes(args[0].Str)
 	if !ok {
+		ctx.SkipReplication = true
 		return types.RespZero
 	}
 
@@ -55,6 +56,7 @@ func (c ExpireAtCommand) Execute(ctx *context.Context, args []types.Value) types
 
 	obj, ok := ctx.Engine.GetBytes(args[0].Str)
 	if !ok {
+		ctx.SkipReplication = true
 		return types.RespZero
 	}
 
@@ -86,6 +88,7 @@ func (c PExpireAtCommand) Execute(ctx *context.Context, args []types.Value) type
 
 	obj, ok := ctx.Engine.GetBytes(args[0].Str)
 	if !ok {
+		ctx.SkipReplication = true
 		return types.RespZero
 	}
 

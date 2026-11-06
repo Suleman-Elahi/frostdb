@@ -6,7 +6,10 @@ import (
 	"time"
 
 	"frostdb/internal/blocking"
+	"frostdb/internal/command/generic"
+	"frostdb/internal/engine/api"
 	"frostdb/internal/engine/object"
+	"frostdb/internal/engine/shard"
 	"frostdb/internal/kernel/context"
 	"frostdb/internal/resp/types"
 )
@@ -45,8 +48,11 @@ func (c XReadCommand) Execute(ctx *context.Context, args []types.Value) types.Va
 				return types.NewError("ERR syntax error")
 			}
 			v, err := strconv.ParseInt(string(args[idx+1].Str), 10, 64)
-			if err != nil || v < 0 {
-				return types.NewError("ERR value is not an integer or out of range")
+			if err != nil {
+				return types.NewError("ERR timeout is not an integer or out of range")
+			}
+			if v < 0 {
+				return types.NewError("ERR timeout is negative")
 			}
 			blockMs = v
 			idx += 2
@@ -54,7 +60,7 @@ func (c XReadCommand) Execute(ctx *context.Context, args []types.Value) types.Va
 			idx++
 			goto parseStreams
 		default:
-			idx++
+			return types.NewError("ERR syntax error")
 		}
 	}
 	return types.NewError("ERR syntax error")
@@ -62,58 +68,67 @@ func (c XReadCommand) Execute(ctx *context.Context, args []types.Value) types.Va
 parseStreams:
 	remaining := args[idx:]
 	if len(remaining) == 0 || len(remaining)%2 != 0 {
-		return types.NewError("ERR Unbalanced XREAD list of streams: for each stream key an ID must be specified")
+		return types.NewError("ERR Unbalanced XREAD list of streams: for each stream key an ID or '$' must be specified.")
 	}
 
 	numStreams := len(remaining) / 2
 	keys := remaining[:numStreams]
 	ids := remaining[numStreams:]
 
-	// Check if any stream uses "+" (read last element)
 	usesPlus := make([]bool, numStreams)
-	for i := 0; i < numStreams; i++ {
-		usesPlus[i] = isSpecialPlusID(string(ids[i].Str))
-	}
-
-	// Resolve "$" to actual last IDs at the start
 	resolvedIDs := make([]string, numStreams)
+	streamKeys := make([]string, numStreams)
 	for i := 0; i < numStreams; i++ {
+		key := string(keys[i].Str)
+		streamKeys[i] = key
 		startID := string(ids[i].Str)
+		usesPlus[i] = isSpecialPlusID(startID)
+		if startID != "$" && !usesPlus[i] {
+			if _, err := object.ParseStreamID(startID); err != nil {
+				return types.NewError("ERR Invalid stream ID specified as stream command argument")
+			}
+		}
+
+		obj, ok := ctx.Engine.Get(key)
+		if ok && obj.Type != object.TypeStream {
+			return types.NewError("WRONGTYPE Operation against a key holding the wrong kind of value")
+		}
+
 		if startID == "$" {
-			// Get the current last ID of the stream
-			key := string(keys[i].Str)
-			obj, ok := ctx.Engine.Get(key)
-			if ok && obj.Type == object.TypeStream {
+			if ok {
 				stream := obj.Value.(*object.Stream)
 				resolvedIDs[i] = stream.LastGeneratedID()
 			} else {
 				resolvedIDs[i] = "0-0"
 			}
 		} else if usesPlus[i] {
-			// "+" means read last element - we'll handle this specially
 			resolvedIDs[i] = "+"
 		} else {
 			resolvedIDs[i] = startID
 		}
 	}
 
-	readOnce := func() types.Value {
+	readOnce := func(ignoreWrongType bool) (types.Value, bool) {
 		results := make([]types.Value, 0, numStreams)
 		for i := 0; i < numStreams; i++ {
-			key := string(keys[i].Str)
+			key := streamKeys[i]
 			startID := resolvedIDs[i]
 
 			obj, ok := ctx.Engine.Get(key)
-			if !ok || obj.Type != object.TypeStream {
+			if !ok {
 				continue
+			}
+			if obj.Type != object.TypeStream {
+				if ignoreWrongType {
+					continue
+				}
+				return types.NewError("WRONGTYPE Operation against a key holding the wrong kind of value"), true
 			}
 			stream := obj.Value.(*object.Stream)
 
 			var entries []object.StreamEntry
 			if usesPlus[i] {
-				// "+" means read the last element only
-				lastEntry := getLastStreamEntry(stream)
-				if lastEntry != nil {
+				if lastEntry := getLastStreamEntry(stream); lastEntry != nil {
 					entries = []object.StreamEntry{*lastEntry}
 				}
 			} else {
@@ -133,59 +148,191 @@ parseStreams:
 			}))
 		}
 		if len(results) == 0 {
-			return types.RespNil
+			if ctx.Protocol >= 3 {
+				return types.NewNull(), false
+			}
+			return types.RespNil, false
 		}
-		return types.NewArray(results)
+		return types.NewArray(results), true
 	}
 
-	res := readOnce()
-	if !res.IsNull || blockMs < 0 || ctx.InScript {
+	res, ok := readOnce(false)
+	if ok || blockMs < 0 || ctx.ExecutingMulti || ctx.InScript {
 		return res
 	}
 
-	// Track blocking client
-	blocking.Inc()
-	defer blocking.Dec()
-
-	streamKeys := make([]string, 0, numStreams)
-	for i := 0; i < numStreams; i++ {
-		streamKeys = append(streamKeys, string(keys[i].Str))
+	// If "+" was specified and the stream was empty/missing at start,
+	// convert "+" to waiting for entries after the current last ID.
+	for i, key := range streamKeys {
+		if usesPlus[i] {
+			obj, ok := ctx.Engine.Get(key)
+			if ok && obj.Type == object.TypeStream {
+				stream := obj.Value.(*object.Stream)
+				resolvedIDs[i] = stream.LastGeneratedID()
+			} else {
+				resolvedIDs[i] = "0-0"
+			}
+			usesPlus[i] = false
+		}
 	}
-	ch, cleanup := ctx.Engine.Subscribe(streamKeys)
-	defer cleanup()
 
-	// Release the command lock before blocking.
-	if ctx.CmdMu != nil {
-		ctx.CmdMu.Unlock()
+	return blockOnStreamKeys(ctx, streamKeys, blockMs, types.RespNil, func() (types.Value, bool) {
+		return readOnce(true)
+	})
+}
+
+func blockOnStreamKeys(
+	ctx *context.Context,
+	keys []string,
+	blockMs int64,
+	nilReply types.Value,
+	tryWakeFn func() (types.Value, bool),
+) types.Value {
+	var waiter *shard.Waiter
+	var legacyCh <-chan struct{}
+	var cleanup func()
+	if be, ok := ctx.Engine.(api.BlockingEngine); ok {
+		waiter, cleanup = be.SubscribeWaiter(keys)
+	} else {
+		legacyCh, cleanup = ctx.Engine.Subscribe(keys)
+	}
+
+	blocking.Inc()
+	generic.UpdateClientBlocked(ctx, true)
+	unblockCh := make(chan generic.UnblockType, 1)
+	generic.RegisterClientUnblockCh(ctx.ClientID, unblockCh)
+
+	blockedActive := true
+	finishBlocked := func(failed bool) {
+		if blockedActive {
+			blockedActive = false
+			if ctx.RecordStatsNow != nil {
+				ctx.RecordStatsNow(failed)
+			}
+			blocking.Dec()
+			generic.UpdateClientBlocked(ctx, false)
+			generic.UnregisterClientUnblockCh(ctx.ClientID)
+		}
 	}
 	defer func() {
-		if ctx.CmdMu != nil {
-			ctx.CmdMu.Lock()
-		}
+		finishBlocked(false)
+		cleanup()
 	}()
 
-	if blockMs == 0 {
-		for {
-			<-ch
-			if r := readOnce(); !r.IsNull {
-				return r
-			}
-		}
+	discCh, stopDisc := ctx.WatchDisconnect()
+	defer stopDisc()
+
+	var timeoutCh <-chan time.Time
+	if blockMs > 0 {
+		timeoutCh = time.After(time.Duration(blockMs) * time.Millisecond)
 	}
 
-	deadline := time.Now().Add(time.Duration(blockMs) * time.Millisecond)
+	if ctx.FlushWriter != nil {
+		ctx.FlushWriter()
+	}
+
+	if ctx.UnlockKeys != nil {
+		ctx.UnlockKeys()
+	}
+
+	var wakeCh <-chan chan shard.SignalAck
+	if waiter != nil {
+		wakeCh = waiter.WakeCh
+	}
+
 	for {
-		remain := time.Until(deadline)
-		if remain <= 0 {
-			return types.RespNil
-		}
 		select {
-		case <-ch:
-			if r := readOnce(); !r.IsNull {
-				return r
+		case ackCh := <-wakeCh:
+			if ctx.LockKeys != nil {
+				ctx.LockKeys()
 			}
-		case <-time.After(remain):
-			return types.RespNil
+			ctx.InWakeup = true
+			dirtyBefore := ctx.Engine.GetDirty()
+			val, ok := tryWakeFn()
+			dirtyAfter := ctx.Engine.GetDirty()
+			ctx.InWakeup = false
+			if ok {
+				failed := val.Type == types.TypeError
+				if !failed && !ctx.SkipReplication && len(ctx.ReplicateAs) > 0 {
+					if dirtyAfter == dirtyBefore {
+						ctx.Engine.AddDirty(1)
+					}
+					_ = ctx.Engine.LogCommand(ctx.ReplicateAs)
+					ctx.SkipReplication = true
+				} else {
+					ctx.SkipReplication = true
+				}
+				cascaded := ctx.TakeSignals()
+				finishBlocked(failed)
+				if ctx.UnlockKeys != nil {
+					ctx.UnlockKeys()
+				}
+				ackCh <- shard.SignalAck{
+					Consumed: true,
+					Cascaded: cascaded,
+				}
+				return val
+			}
+			if ctx.UnlockKeys != nil {
+				ctx.UnlockKeys()
+			}
+			ackCh <- shard.SignalAck{Consumed: true}
+
+		case <-legacyCh:
+			if ctx.LockKeys != nil {
+				ctx.LockKeys()
+			}
+			val, ok := tryWakeFn()
+			if ok {
+				failed := val.Type == types.TypeError
+				finishBlocked(failed)
+				if ctx.UnlockKeys != nil {
+					ctx.UnlockKeys()
+				}
+				return val
+			}
+			if ctx.UnlockKeys != nil {
+				ctx.UnlockKeys()
+			}
+
+		case <-timeoutCh:
+			ctx.SkipReplication = true
+			finishBlocked(false)
+			if ctx.Protocol >= 3 {
+				return types.NewNull()
+			}
+			return nilReply
+
+		case <-ctx.Done:
+			ctx.SkipReplication = true
+			finishBlocked(false)
+			return nilReply
+
+		case <-discCh:
+			ctx.SkipReplication = true
+			finishBlocked(false)
+			return nilReply
+
+		case <-blocking.StopSignal():
+			ctx.SkipReplication = true
+			finishBlocked(false)
+			if ctx.Protocol >= 3 {
+				return types.NewNull()
+			}
+			return nilReply
+
+		case ut := <-unblockCh:
+			ctx.SkipReplication = true
+			if ut == generic.UnblockError {
+				finishBlocked(true)
+				return types.NewError("UNBLOCKED client unblocked via CLIENT UNBLOCK")
+			}
+			finishBlocked(false)
+			if ctx.Protocol >= 3 {
+				return types.NewNull()
+			}
+			return nilReply
 		}
 	}
 }
+

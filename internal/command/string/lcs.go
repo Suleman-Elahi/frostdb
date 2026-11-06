@@ -204,6 +204,6 @@ func getStringVal(ctx *context.Context, keyBytes []byte) (string, bool) {
 	if obj.Type != object.TypeString {
 		return "", false
 	}
-	s, _ := obj.Value.(string)
-	return s, true
+	s, _ := obj.Value.([]byte)
+	return string(s), true
 }

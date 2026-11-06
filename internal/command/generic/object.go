@@ -85,7 +85,7 @@ func encodingName(obj *object.Object) string {
 			return "raw"
 		default:
 			// Redis uses "embstr" for strings ≤44 bytes, "raw" for longer.
-			if s, ok := obj.Value.(string); ok {
+			if s, ok := obj.Value.([]byte); ok {
 				if len(s) <= 44 {
 					return "embstr"
 				}
@@ -115,38 +115,8 @@ func listEncodingName(obj *object.Object) string {
 	if !ok {
 		return "quicklist"
 	}
-
-	entries := l.Snapshot()
-	cfg := listMaxListpackSize.Load()
-
-	if cfg > 0 {
-		// Positive values act like max entries per compact node.
-		if int64(len(entries)) > cfg {
-			return "quicklist"
-		}
-		return "listpack"
-	}
-
-	maxNodeBytes := int64(8192) // Redis default for -2.
-	switch cfg {
-	case -1:
-		maxNodeBytes = 4096
-	case -2:
-		maxNodeBytes = 8192
-	case -3:
-		maxNodeBytes = 16384
-	case -4:
-		maxNodeBytes = 32768
-	case -5:
-		maxNodeBytes = 65536
-	}
-
-	total := int64(0)
-	for _, e := range entries {
-		total += int64(len(e))
-		if total > maxNodeBytes {
-			return "quicklist"
-		}
+	if l.IsQuicklist() {
+		return "quicklist"
 	}
 	return "listpack"
 }

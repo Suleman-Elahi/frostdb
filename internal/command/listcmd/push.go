@@ -50,12 +50,8 @@ func (c PushCommand) Execute(ctx *context.Context, args []types.Value) types.Val
 		}
 	}
 
-	// Wake up any blocking clients (deferred during MULTI/EXEC)
-	if ctx.ExecutingMulti {
-		ctx.DeferredSignals = append(ctx.DeferredSignals, key)
-	} else {
-		ctx.Engine.SignalKey(key)
-	}
+	// Wake up any blocking clients after command lock release / EXEC
+	ctx.SignalKey(key)
 
 	return types.NewInt(int64(list.LLen()))
 }

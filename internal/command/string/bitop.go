@@ -3,6 +3,7 @@ package str
 import (
 	"strings"
 
+	"frostdb/internal/engine/keyevent"
 	"frostdb/internal/engine/object"
 	"frostdb/internal/kernel/context"
 	"frostdb/internal/resp/types"
@@ -50,11 +51,11 @@ func (c BitOpCommand) Execute(ctx *context.Context, args []types.Value) types.Va
 		if !exists {
 			continue
 		}
-		strVal, ok := obj.Value.(string)
+		strVal, ok := obj.Value.([]byte)
 		if !ok {
 			return types.NewError("WRONGTYPE Operation against a key holding the wrong kind of value")
 		}
-		b := []byte(strVal)
+		b := strVal
 		if len(b) > maxLen {
 			maxLen = len(b)
 		}
@@ -140,8 +141,16 @@ func (c BitOpCommand) Execute(ctx *context.Context, args []types.Value) types.Va
 		}
 	}
 
-	newObj := object.AcquireRawStringObject(string(result))
+	oldObj, existed := ctx.Engine.Get(destKey)
+	newObj := object.AcquireRawStringObject(result)
 	ctx.Engine.Set(destKey, newObj)
+	if existed && oldObj != nil {
+		ctx.Engine.NotifyKeyEvent(ctx.DB, uint32(keyevent.FlagOverwrite), "overwritten", destKey)
+		if oldObj.Type != object.TypeString {
+			ctx.Engine.NotifyKeyEvent(ctx.DB, uint32(keyevent.FlagTypeChanged), "type_changed", destKey)
+		}
+	}
+	ctx.Engine.NotifyKeyEvent(ctx.DB, uint32(keyevent.FlagString), "set", destKey)
 
 	return types.NewInt(int64(maxLen))
 }

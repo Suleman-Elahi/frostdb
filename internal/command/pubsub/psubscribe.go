@@ -17,6 +17,9 @@ func (c PSubscribeCommand) Execute(ctx *context.Context, args []types.Value) typ
 	if len(args) < 1 {
 		return types.NewError("ERR wrong number of arguments for 'psubscribe' command")
 	}
+	if checkPubSubOOM(ctx, "PSUBSCRIBE", args) {
+		return types.NewError("OOM command not allowed when used memory > 'maxmemory'.")
+	}
 
 	if ctx.Subscriptions == nil {
 		ctx.Subscriptions = make(map[string]func())
@@ -29,6 +32,7 @@ func (c PSubscribeCommand) Execute(ctx *context.Context, args []types.Value) typ
 	}
 	ctx.PubSubMode = true
 
+	var lastConfirm types.Value
 	for _, arg := range args {
 		pattern := string(arg.Str)
 		
@@ -44,7 +48,14 @@ func (c PSubscribeCommand) Execute(ctx *context.Context, args []types.Value) typ
 			types.NewString(pattern),
 			types.NewInt(total),
 		})
-		encoder.Encode(ctx.Conn, confirm)
+		lastConfirm = confirm
+		if !ctx.ExecutingMulti || len(args) > 1 {
+			encoder.Encode(ctx.Conn, confirm)
+		}
+	}
+
+	if ctx.ExecutingMulti && len(args) == 1 {
+		return lastConfirm
 	}
 
 	return types.Value{Type: types.TypeNoReply}

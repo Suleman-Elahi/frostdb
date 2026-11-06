@@ -11,7 +11,9 @@ type Set struct {
 	// set is mutated.
 	scanSnap    []scanEntry
 	scanSnapVer uint64 // version counter; incremented on mutation
-	snapVer     uint64 // version when scanSnap was built
+	snapVer      uint64 // version when scanSnap was built
+	RehashSteps  int    // mock rehashing steps
+	RehashedSize int    // size at which rehashing mock was last triggered
 }
 
 func NewSet() *Set {

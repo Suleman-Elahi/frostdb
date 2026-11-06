@@ -42,11 +42,13 @@ func executeBitfield(ctx *context.Context, args []types.Value, readOnly bool) ty
 		if obj.Type != object.TypeString {
 			return types.NewError("WRONGTYPE Operation against a key holding the wrong kind of value")
 		}
-		s, ok := obj.Value.(string)
+		s, ok := obj.Value.([]byte)
 		if !ok {
 			return types.NewError("ERR internal string encoding")
 		}
-		data = []byte(s)
+		// Copy: BITFIELD mutates data in place below, and the live Object's
+		// storage must not be modified until the new Object replaces it.
+		data = append([]byte(nil), s...)
 	}
 
 	mode := overflowWrap
@@ -184,7 +186,7 @@ func executeBitfield(ctx *context.Context, args []types.Value, readOnly bool) ty
 	}
 
 	if dirty {
-		ctx.Engine.Set(key, object.AcquireStringObject(string(data)))
+		ctx.Engine.Set(key, object.AcquireStringObject(data))
 	}
 
 	return types.NewArray(out)

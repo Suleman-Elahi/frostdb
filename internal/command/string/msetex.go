@@ -146,7 +146,7 @@ func (c MSetEXCommand) Execute(ctx *context.Context, args []types.Value) types.V
 	// Set all keys
 	for i := 0; i < len(kvPairs); i += 2 {
 		key := string(kvPairs[i].Str)
-		val := string(kvPairs[i+1].Str)
+		val := kvPairs[i+1].Str
 		obj := object.AcquireStringObject(val)
 
 		if keepttl {

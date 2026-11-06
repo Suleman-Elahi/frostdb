@@ -129,6 +129,7 @@ func hashToCmd(obj *model.HashObject, useLexOrder bool) []CmdLine {
 
 var zAddCmd = []byte("ZADD")
 
+
 func zSetToCmd(obj *model.ZSetObject) CmdLine {
 	cmdLine := make([][]byte, 2+obj.GetElemCount()*2)
 	cmdLine[0] = zAddCmd

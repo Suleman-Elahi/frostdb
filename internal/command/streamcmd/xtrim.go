@@ -48,10 +48,27 @@ func (c XTrimCommand) Execute(ctx *context.Context, args []types.Value) types.Va
 	threshold := string(args[idx].Str)
 	idx++
 
-	// Parse optional LIMIT and ACKED/DELREF
+	var maxlen int
+	if strategy == "MAXLEN" {
+		v, err := strconv.Atoi(threshold)
+		if err != nil {
+			return types.NewError("ERR value is not an integer or out of range")
+		}
+		if v < 0 {
+			return types.NewError("ERR The MAXLEN argument must be >= 0.")
+		}
+		maxlen = v
+	} else {
+		if _, err := object.ParseStreamID(threshold); err != nil {
+			return types.NewError("ERR Invalid stream ID specified as stream command argument")
+		}
+	}
+
+	// Parse optional LIMIT and KEEPREF/ACKED/DELREF
 	limit := -1
 	refPolicy := object.StreamTrimKeepRef
-	
+	hasPolicy := false
+
 	for idx < len(args) {
 		opt := strings.ToUpper(string(args[idx].Str))
 		switch opt {
@@ -69,14 +86,29 @@ func (c XTrimCommand) Execute(ctx *context.Context, args []types.Value) types.Va
 			}
 			limit = v
 			idx += 2
+		case "KEEPREF":
+			if hasPolicy {
+				return types.NewError("ERR syntax error, only one of KEEPREF, DELREF, or ACKED can be specified")
+			}
+			refPolicy = object.StreamTrimKeepRef
+			hasPolicy = true
+			idx++
 		case "ACKED":
+			if hasPolicy {
+				return types.NewError("ERR syntax error, only one of KEEPREF, DELREF, or ACKED can be specified")
+			}
 			refPolicy = object.StreamTrimAcked
+			hasPolicy = true
 			idx++
 		case "DELREF":
+			if hasPolicy {
+				return types.NewError("ERR syntax error, only one of KEEPREF, DELREF, or ACKED can be specified")
+			}
 			refPolicy = object.StreamTrimDelRef
+			hasPolicy = true
 			idx++
 		default:
-			idx++
+			return types.NewError("ERR syntax error")
 		}
 	}
 
@@ -93,26 +125,18 @@ func (c XTrimCommand) Execute(ctx *context.Context, args []types.Value) types.Va
 	var trimmed int
 	switch strategy {
 	case "MAXLEN":
-		maxlen, err := strconv.Atoi(threshold)
-		if err != nil || maxlen < 0 {
-			return types.NewError("ERR value is not an integer or out of range")
-		}
-		if refPolicy != object.StreamTrimKeepRef {
-			// Use policy-aware trimming
-			trimmed = stream.TrimMaxLenWithPolicy(maxlen, approx, refPolicy)
-		} else if approx {
-			trimmed = stream.TrimMaxLenApprox(maxlen, limit)
-		} else {
-			trimmed = stream.TrimMaxLen(maxlen)
-		}
+		trimmed = stream.TrimMaxLenFull(maxlen, approx, limit, refPolicy)
 	case "MINID":
-		if refPolicy != object.StreamTrimKeepRef {
-			// Use policy-aware trimming
-			trimmed = stream.TrimMinIDWithPolicy(threshold, approx, refPolicy)
-		} else if approx {
-			trimmed = stream.TrimMinIDApprox(threshold, limit)
-		} else {
-			trimmed = stream.TrimMinID(threshold)
+		trimmed = stream.TrimMinIDFull(threshold, approx, limit, refPolicy)
+	}
+
+	if approx && refPolicy == object.StreamTrimKeepRef {
+		ctx.ReplicateAs = [][]byte{
+			[]byte("XTRIM"),
+			[]byte(key),
+			[]byte("MAXLEN"),
+			[]byte("="),
+			[]byte(strconv.Itoa(stream.Len())),
 		}
 	}
 

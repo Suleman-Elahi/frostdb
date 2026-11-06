@@ -22,7 +22,7 @@ import (
 	"frostdb/internal/command/zsetcmd"
 	"frostdb/internal/engine/core"
 	"frostdb/internal/engine/eviction"
-	"frostdb/internal/engine/rdb"
+	"frostdb/internal/engine/persistence/wal"
 	"frostdb/internal/lifecycle"
 	"frostdb/internal/logger"
 	"frostdb/internal/network/server"
@@ -34,10 +34,18 @@ func main() {
 	logLevel := "info"
 	logJSON := false
 	portStr := "6379"
+	appendFsync := "everysec"
+	walErrorPolicy := "stop-writes"
 
 	for i, arg := range os.Args {
 		if (arg == "--port" || arg == "-port") && i+1 < len(os.Args) {
 			portStr = os.Args[i+1]
+		}
+		if (arg == "--appendfsync" || arg == "-appendfsync") && i+1 < len(os.Args) {
+			appendFsync = os.Args[i+1]
+		}
+		if (arg == "--wal-error-policy" || arg == "-wal-error-policy") && i+1 < len(os.Args) {
+			walErrorPolicy = os.Args[i+1]
 		}
 		if (arg == "--loglevel" || arg == "-loglevel") && i+1 < len(os.Args) {
 			logLevel = os.Args[i+1]
@@ -52,8 +60,15 @@ func main() {
 	if envDir := os.Getenv("FROST_DATA_DIR"); envDir != "" {
 		dataDir = envDir
 	}
+	if envFsync := os.Getenv("FROST_APPEND_FSYNC"); envFsync != "" {
+		appendFsync = envFsync
+	}
+	if envPolicy := os.Getenv("FROST_WAL_ERROR_POLICY"); envPolicy != "" {
+		walErrorPolicy = envPolicy
+	}
 
 	// Parse config file if passed
+
 	for _, arg := range os.Args[1:] {
 		if !strings.HasPrefix(arg, "-") {
 			if _, err := os.Stat(arg); err == nil {
@@ -73,6 +88,10 @@ func main() {
 								portStr = val
 							} else if key == "dir" {
 								dataDir = val
+							} else if key == "appendfsync" {
+								appendFsync = val
+							} else if key == "wal-error-policy" {
+								walErrorPolicy = val
 							}
 						}
 					}
@@ -80,6 +99,17 @@ func main() {
 				break
 			}
 		}
+	}
+
+	fsyncMode, err := wal.ParseFsyncMode(appendFsync)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid appendfsync setting: %v\n", err)
+		os.Exit(1)
+	}
+	failurePolicy, err := core.ParseWALFailurePolicy(walErrorPolicy)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid wal-error-policy setting: %v\n", err)
+		os.Exit(1)
 	}
 
 	// Initialize structured logger
@@ -100,7 +130,8 @@ func main() {
 	// Initialize engine with persistence
 	engine, err := core.NewWithPersistence(core.PersistOptions{
 		DataDir:            dataDir,
-		WALSyncOnWrite:     false,
+		WALFsyncMode:       fsyncMode,
+		WALFailurePolicy:   failurePolicy,
 		CheckpointInterval: 5 * time.Minute,
 		Eviction: eviction.Config{
 			MaxMemory:    0,
@@ -128,8 +159,7 @@ func main() {
 		}
 	}
 	if rdbPath != "" {
-		imp := rdb.NewImporter(db0View.Shards())
-		n, err := imp.ImportFile(rdbPath)
+		n, err := coreEngine.LoadRDB(rdbPath)
 		if err != nil {
 			logger.Error("RDB import failed", "path", rdbPath, "error", err)
 			os.Exit(1)
@@ -137,6 +167,8 @@ func main() {
 		logger.Info("RDB import complete", "keys", n, "path", rdbPath)
 	}
 
+
+	
 	// Graceful shutdown manager
 	shutdown := lifecycle.NewManager()
 
@@ -459,5 +491,8 @@ func registerCommands() {
 	registry.Register(pubsub.PublishCommand{})
 	registry.Register(pubsub.PSubscribeCommand{})
 	registry.Register(pubsub.PUnsubscribeCommand{})
+	registry.Register(pubsub.SSubscribeCommand{})
+	registry.Register(pubsub.SUnsubscribeCommand{})
+	registry.Register(pubsub.SPublishCommand{})
 	registry.Register(pubsub.PubSubMetaCommand{})
 }

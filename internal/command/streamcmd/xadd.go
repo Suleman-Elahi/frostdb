@@ -101,12 +101,13 @@ func (c XAddCommand) Execute(ctx *context.Context, args []types.Value) types.Val
 	}
 
 	actualID := ""
+	resolvedIID := ""
 	if opts.idmp != nil {
-		iid := opts.idmp.iid
+		resolvedIID = opts.idmp.iid
 		if opts.idmp.auto {
-			iid = idmpAutoIID(fields)
+			resolvedIID = idmpAutoIID(fields)
 		}
-		idv, _, err := stream.AddIDMP(id, fields, opts.idmp.producer, iid)
+		idv, _, err := stream.AddIDMP(id, fields, opts.idmp.producer, resolvedIID)
 		if err != nil {
 			if err.Error() == "ERR Invalid stream ID" {
 				return types.NewError("ERR Invalid stream ID specified")
@@ -141,28 +142,47 @@ func (c XAddCommand) Execute(ctx *context.Context, args []types.Value) types.Val
 		if err != nil || maxlen < 0 {
 			return types.NewError("ERR value is not an integer or out of range")
 		}
-		// Use policy-aware trimming if a ref policy is specified
-		if opts.trim.refPolicy != object.StreamTrimKeepRef {
-			stream.TrimMaxLenWithPolicy(maxlen, opts.trim.approx, opts.trim.refPolicy)
-		} else if opts.trim.approx {
-			stream.TrimMaxLenApprox(maxlen, opts.trim.limit)
-		} else {
-			stream.TrimMaxLen(maxlen)
-		}
+		stream.TrimMaxLenFull(maxlen, opts.trim.approx, opts.trim.limit, opts.trim.refPolicy)
 	case "MINID":
-		if opts.trim.refPolicy != object.StreamTrimKeepRef {
-			stream.TrimMinIDWithPolicy(opts.trim.threshold, opts.trim.approx, opts.trim.refPolicy)
-		} else if opts.trim.approx {
-			stream.TrimMinIDApprox(opts.trim.threshold, opts.trim.limit)
-		} else {
-			stream.TrimMinID(opts.trim.threshold)
-		}
+		stream.TrimMinIDFull(opts.trim.threshold, opts.trim.approx, opts.trim.limit, opts.trim.refPolicy)
 	}
 
-	if ctx.ExecutingMulti {
-		ctx.DeferredSignals = append(ctx.DeferredSignals, key)
-	} else {
-		ctx.Engine.SignalKey(key)
+	// Normalize WAL replication so generated IDs and IDMPAUTO are deterministic on replay.
+	rep := [][]byte{[]byte("XADD"), []byte(key)}
+	if opts.noMkStream {
+		rep = append(rep, []byte("NOMKSTREAM"))
 	}
+	switch opts.trim.refPolicy {
+	case object.StreamTrimDelRef:
+		rep = append(rep, []byte("DELREF"))
+	case object.StreamTrimAcked:
+		rep = append(rep, []byte("ACKED"))
+	}
+	if opts.idmp != nil {
+		rep = append(rep, []byte("IDMP"), []byte(opts.idmp.producer), []byte(resolvedIID))
+	}
+	if opts.trim.strategy != "" {
+		if opts.trim.approx && opts.trim.refPolicy == object.StreamTrimKeepRef {
+			rep = append(rep, []byte("MAXLEN"), []byte("="), []byte(strconv.Itoa(stream.Len())))
+		} else {
+			rep = append(rep, []byte(opts.trim.strategy))
+			if opts.trim.approx {
+				rep = append(rep, []byte("~"))
+			} else {
+				rep = append(rep, []byte("="))
+			}
+			rep = append(rep, []byte(opts.trim.threshold))
+			if opts.trim.approx && opts.trim.limit >= 0 {
+				rep = append(rep, []byte("LIMIT"), []byte(strconv.Itoa(opts.trim.limit)))
+			}
+		}
+	}
+	rep = append(rep, []byte(actualID))
+	for _, f := range fields {
+		rep = append(rep, []byte(f.Name), []byte(f.Value))
+	}
+	ctx.ReplicateAs = rep
+
+	ctx.SignalKey(key)
 	return types.NewString(actualID)
 }

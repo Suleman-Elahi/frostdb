@@ -2,13 +2,16 @@ package core
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"frostdb/internal/concurrency"
 	"frostdb/internal/engine/api"
 	"frostdb/internal/engine/eviction"
 	"frostdb/internal/engine/keyevent"
@@ -21,25 +24,87 @@ import (
 	"frostdb/internal/logger"
 )
 
+// WALFailurePolicy controls write admission while WAL I/O is unhealthy.
+type WALFailurePolicy string
+
+const (
+	// WALFailureStopWrites preserves durability guarantees by rejecting writes
+	// after a WAL failure until a subsequent sync succeeds.
+	WALFailureStopWrites WALFailurePolicy = "stop-writes"
+	// WALFailureContinue keeps accepting writes during WAL failures. It is
+	// intended only for operators who explicitly prefer availability over
+	// durability while storage is impaired.
+	WALFailureContinue WALFailurePolicy = "continue"
+)
+
+// ParseWALFailurePolicy validates the wal-error-policy setting. The empty
+// value defaults to the production-safe stop-writes behavior.
+func ParseWALFailurePolicy(value string) (WALFailurePolicy, error) {
+	policy := WALFailurePolicy(strings.ToLower(strings.TrimSpace(value)))
+	if policy == "" {
+		return WALFailureStopWrites, nil
+	}
+	switch policy {
+	case WALFailureStopWrites, WALFailureContinue:
+		return policy, nil
+	default:
+		return "", fmt.Errorf("invalid wal error policy %q (expected stop-writes or continue)", value)
+	}
+}
+
 // PersistOptions configures persistence for the engine
 type PersistOptions struct {
-	DataDir            string
+	DataDir string
+	// WALFsyncMode controls WAL durability: always, everysec (default), or no.
+	WALFsyncMode wal.FsyncMode
+	// WALFailurePolicy controls whether unhealthy WAL storage blocks future
+	// writes. The empty value defaults to stop-writes.
+	WALFailurePolicy WALFailurePolicy
+	// WALSyncOnWrite is retained for source compatibility; it maps to always
+	// when WALFsyncMode is not explicitly configured.
 	WALSyncOnWrite     bool
 	CheckpointInterval time.Duration // 0 = no auto checkpoint
 	Eviction           eviction.Config
 }
+
+type CheckpointStatus struct {
+	InProgress           bool
+	LastSuccessUnixMilli int64
+	LastError            string
+	SuccessCount         uint64
+	FailureCount         uint64
+}
+
+var errEngineClosed = errors.New("engine is closed")
 
 type Engine struct {
 	// dbs holds NumDBs logical databases, each with its own shard set.
 	dbs [NumDBs]*DBView
 
 	// PubSub (engine-wide, not DB-scoped)
-	pubsubMu   sync.RWMutex
-	pubsubSubs map[string][]chan api.PubSubMessage
+	pubsubMu     sync.RWMutex
+	pubsubSubs   map[string][]chan api.PubSubMessage
+	pubsubMemory atomic.Int64
 
 	// Persistence
-	wal     *wal.WAL
-	dataDir string
+	wal              *wal.WAL
+	dataDir          string
+	walFailurePolicy WALFailurePolicy
+
+	checkpointMu        sync.Mutex
+	checkpointStatusMu  sync.RWMutex
+	checkpointInFlight  int32
+	lastCheckpointAt    time.Time
+	lastCheckpointErr   string
+	checkpointSuccesses uint64
+	checkpointFailures  uint64
+
+	persistenceMu     sync.Mutex
+	persistenceStopCh chan struct{}
+	persistenceWg     sync.WaitGroup
+	closed            int32
+	closeOnce         sync.Once
+	closeErr          error
 
 	// Eviction
 	Evictor *eviction.Evictor
@@ -50,10 +115,10 @@ type Engine struct {
 
 	onTouchCb func(key string)
 
-	replMu   sync.Mutex
+	replMu   sync.RWMutex
 	replicas []*replicaInfo
 
-	dirty               int64 // rdb_changes_since_last_save counter
+	dirty                int64 // rdb_changes_since_last_save counter
 	aofRewriteInProgress int32 // 1 when background AOF rewrite is running
 
 	// Active expire
@@ -75,7 +140,8 @@ func (e *Engine) Shards() [256]*shard.Shard {
 // New creates an in-memory-only engine (no persistence). Used by tests.
 func New() api.Engine {
 	e := &Engine{
-		pubsubSubs: make(map[string][]chan api.PubSubMessage),
+		pubsubSubs:       make(map[string][]chan api.PubSubMessage),
+		walFailurePolicy: WALFailureStopWrites,
 	}
 	for i := 0; i < NumDBs; i++ {
 		e.dbs[i] = newDBView(e, i)
@@ -96,9 +162,15 @@ func New() api.Engine {
 // NewWithPersistence creates an engine with WAL and checkpoint support.
 // It recovers state from disk on startup.
 func NewWithPersistence(opts PersistOptions) (api.Engine, error) {
+	failurePolicy, err := ParseWALFailurePolicy(string(opts.WALFailurePolicy))
+	if err != nil {
+		return nil, err
+	}
 	e := &Engine{
-		pubsubSubs: make(map[string][]chan api.PubSubMessage),
-		dataDir:    opts.DataDir,
+		pubsubSubs:        make(map[string][]chan api.PubSubMessage),
+		dataDir:           opts.DataDir,
+		walFailurePolicy:  failurePolicy,
+		persistenceStopCh: make(chan struct{}),
 	}
 	for i := 0; i < NumDBs; i++ {
 		e.dbs[i] = newDBView(e, i)
@@ -119,16 +191,22 @@ func NewWithPersistence(opts PersistOptions) (api.Engine, error) {
 		return nil, err
 	}
 
-	// Load checkpoint records
+	// Load checkpoint records into the database encoded in each record.
+	// Legacy FROSTCK1 records omit DB and therefore correctly default to DB 0.
 	var skipped int
 	for _, rec := range state.Records {
+		if int(rec.DB) >= NumDBs {
+			skipped++
+			logger.Warn("recovery: skip key with invalid database", "key", rec.Key, "db", rec.DB)
+			continue
+		}
 		obj, err := deserializeObject(rec)
 		if err != nil {
 			skipped++
 			logger.Warn("recovery: skip key", "key", rec.Key, "error", err)
 			continue
 		}
-		s := e.dbs[0].getShard(rec.Key)
+		s := e.dbs[rec.DB].getShard(rec.Key)
 		s.Set(rec.Key, obj)
 	}
 	if skipped > 0 {
@@ -142,9 +220,11 @@ func NewWithPersistence(opts PersistOptions) (api.Engine, error) {
 
 	// Open WAL for new writes
 	walOpts := wal.Options{
-		Dir:         filepath.Join(opts.DataDir, "wal"),
-		MaxFileSize: 64 * 1024 * 1024,
-		SyncOnWrite: opts.WALSyncOnWrite,
+		Dir:            filepath.Join(opts.DataDir, "wal"),
+		MaxFileSize:    64 * 1024 * 1024,
+		InitialSegment: state.CheckpointMetadata.WALCutoff + 1,
+		FsyncMode:      opts.WALFsyncMode,
+		SyncOnWrite:    opts.WALSyncOnWrite,
 	}
 	w, err := wal.Open(walOpts)
 	if err != nil {
@@ -152,9 +232,12 @@ func NewWithPersistence(opts PersistOptions) (api.Engine, error) {
 	}
 	e.wal = w
 
-	// Start auto-checkpoint if configured
+	// Start auto-checkpoint if configured. It is tracked so Close waits for it
+	// before closing the WAL.
 	if opts.CheckpointInterval > 0 {
-		go e.checkpointLoop(opts.CheckpointInterval)
+		e.startPersistenceWorker(func() {
+			e.checkpointLoop(opts.CheckpointInterval)
+		})
 	}
 
 	e.startActiveExpireLoop()
@@ -216,6 +299,10 @@ func (e *Engine) GetDirty() int64 {
 	return atomic.LoadInt64(&e.dirty)
 }
 
+func (e *Engine) AddDirty(n int64) {
+	atomic.AddInt64(&e.dirty, n)
+}
+
 // ResetDirty resets the dirty counter (called after save/checkpoint).
 func (e *Engine) ResetDirty() {
 	atomic.StoreInt64(&e.dirty, 0)
@@ -228,6 +315,10 @@ var walBufPool = sync.Pool{
 	},
 }
 
+var walCommandMagic = [...]byte{'F', 'D', 'B', 'W'}
+
+const walCommandVersion byte = 1
+
 type replicaInfo struct {
 	conn   net.Conn
 	lastDB int
@@ -236,61 +327,35 @@ type replicaInfo struct {
 // LogCommand writes a raw command to the WAL (called by mutating commands).
 // Returns an error if the WAL write fails.
 func (e *Engine) LogCommand(db int, args [][]byte) error {
-	if e.wal == nil {
-		return nil
+	if db < 0 || db >= NumDBs {
+		return fmt.Errorf("wal: invalid database %d", db)
 	}
-	bp := walBufPool.Get().(*[]byte)
-	buf := (*bp)[:0]
+	var err error
+	if e.wal != nil {
+		bp := walBufPool.Get().(*[]byte)
+		buf := (*bp)[:0]
 
-	buf = binary.LittleEndian.AppendUint16(buf, uint16(len(args)))
-	for _, arg := range args {
-		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(arg)))
-		buf = append(buf, arg...)
-	}
-
-	err := e.wal.Append(buf)
-	if err != nil {
-		logger.Error("wal: append failed", "error", err)
-	}
-	*bp = buf
-	walBufPool.Put(bp)
-
-	// Propagate to attached test replicas
-	e.replMu.Lock()
-	if len(e.replicas) > 0 {
-		// Build RESP array
-		var replBuf []byte
-		replBuf = append(replBuf, '*')
-		replBuf = append(replBuf, []byte(fmt.Sprint(len(args)))...)
-		replBuf = append(replBuf, '\r', '\n')
+		// Versioned command framing keeps the original DB alongside the command.
+		// Legacy records begin with the uint16 argument count and remain readable
+		// as DB 0 during recovery.
+		buf = append(buf, walCommandMagic[:]...)
+		buf = append(buf, walCommandVersion, byte(db))
+		buf = binary.LittleEndian.AppendUint16(buf, uint16(len(args)))
 		for _, arg := range args {
-			replBuf = append(replBuf, '$')
-			replBuf = append(replBuf, []byte(fmt.Sprint(len(arg)))...)
-			replBuf = append(replBuf, '\r', '\n')
-			replBuf = append(replBuf, arg...)
-			replBuf = append(replBuf, '\r', '\n')
+			buf = binary.LittleEndian.AppendUint32(buf, uint32(len(arg)))
+			buf = append(buf, arg...)
 		}
-		
-		validReplicas := make([]*replicaInfo, 0, len(e.replicas))
-		for _, r := range e.replicas {
-			var werr error
-			if r.lastDB != db {
-				selectBuf := []byte(fmt.Sprintf("*2\r\n$6\r\nSELECT\r\n$%d\r\n%d\r\n", len(fmt.Sprint(db)), db))
-				_, werr = r.conn.Write(selectBuf)
-				if werr == nil {
-					r.lastDB = db
-				}
-			}
-			if werr == nil {
-				_, werr = r.conn.Write(replBuf)
-			}
-			if werr == nil {
-				validReplicas = append(validReplicas, r)
-			}
+
+		err = e.wal.Append(buf)
+		if err != nil {
+			logger.Error("wal: append failed", "error", err)
 		}
-		e.replicas = validReplicas
+		*bp = buf
+		walBufPool.Put(bp)
 	}
-	e.replMu.Unlock()
+
+	// Propagate to attached test replicas even in in-memory mode (e.wal == nil).
+	e.PropagateToReplicas(db, args)
 
 	return err
 }
@@ -299,6 +364,13 @@ func (e *Engine) LogCommand(db int, args [][]byte) error {
 // without WAL logging. Used for commands like SWAPDB, SELECT, and key expiry
 // DEL that need to be replicated but aren't normal write commands.
 func (e *Engine) PropagateToReplicas(db int, args [][]byte) {
+	e.replMu.RLock()
+	hasReplicas := len(e.replicas) > 0
+	e.replMu.RUnlock()
+	if !hasReplicas {
+		return
+	}
+
 	e.replMu.Lock()
 	defer e.replMu.Unlock()
 	if len(e.replicas) == 0 {
@@ -340,6 +412,14 @@ func (e *Engine) Subscribe(keys []string) (<-chan struct{}, func()) {
 	return e.dbs[0].Subscribe(keys)
 }
 
+func (e *Engine) SubscribeWaiter(keys []string) (*shard.Waiter, func()) {
+	return e.dbs[0].SubscribeWaiter(keys)
+}
+
+func (e *Engine) FlushSignals(keys []string) {
+	e.dbs[0].FlushSignals(keys)
+}
+
 func (e *Engine) SignalKey(key string) {
 	e.dbs[0].SignalKey(key)
 }
@@ -362,23 +442,83 @@ func (e *Engine) PubSubSubscribe(channel string, ch chan api.PubSubMessage) func
 	}
 
 	e.pubsubSubs[channel] = append(e.pubsubSubs[channel], ch)
+	memBytes := int64(len(channel)*2 + 256)
+	e.pubsubMemory.Add(memBytes)
 
+	var once sync.Once
 	cleanup := func() {
-		e.pubsubMu.Lock()
-		defer e.pubsubMu.Unlock()
-		subs := e.pubsubSubs[channel]
-		for i, sub := range subs {
-			if sub == ch {
-				e.pubsubSubs[channel] = append(subs[:i], subs[i+1:]...)
-				break
+		once.Do(func() {
+			e.pubsubMemory.Add(-memBytes)
+			e.pubsubMu.Lock()
+			defer e.pubsubMu.Unlock()
+			subs := e.pubsubSubs[channel]
+			for i, sub := range subs {
+				if sub == ch {
+					e.pubsubSubs[channel] = append(subs[:i], subs[i+1:]...)
+					break
+				}
 			}
-		}
-		if len(e.pubsubSubs[channel]) == 0 {
-			delete(e.pubsubSubs, channel)
-		}
+			if len(e.pubsubSubs[channel]) == 0 {
+				delete(e.pubsubSubs, channel)
+			}
+		})
 	}
 
 	return cleanup
+}
+
+func (e *Engine) CheckPubSubOOM(argBytes int64) bool {
+	cfg := e.Evictor.GetConfig()
+	if cfg.MaxMemory <= 0 {
+		return false
+	}
+	if e.TryEvict() {
+		return true
+	}
+	used := e.Evictor.UsedMemory() + e.pubsubMemory.Load() + argBytes
+	if used > cfg.MaxMemory {
+		if cfg.Policy == eviction.PolicyNoEviction {
+			return true
+		}
+		e.Evictor.Evict()
+		used = e.Evictor.UsedMemory() + e.pubsubMemory.Load() + argBytes
+		if used > cfg.MaxMemory {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *Engine) PubSubChannels(pattern string, shard bool) []string {
+	e.pubsubMu.RLock()
+	defer e.pubsubMu.RUnlock()
+
+	var channels []string
+	for subChannel, subs := range e.pubsubSubs {
+		if len(subs) == 0 {
+			continue
+		}
+		if shard {
+			if strings.HasPrefix(subChannel, "__shard:") {
+				ch := subChannel[len("__shard:"):]
+				if pattern == "" || pattern == "*" {
+					channels = append(channels, ch)
+				} else if matched, _ := filepath.Match(pattern, ch); matched {
+					channels = append(channels, ch)
+				}
+			}
+		} else {
+			if strings.HasPrefix(subChannel, "__pattern:") || strings.HasPrefix(subChannel, "__shard:") {
+				continue
+			}
+			if pattern == "" || pattern == "*" {
+				channels = append(channels, subChannel)
+			} else if matched, _ := filepath.Match(pattern, subChannel); matched {
+				channels = append(channels, subChannel)
+			}
+		}
+	}
+	return channels
 }
 
 func (e *Engine) PubSubPublish(channel, message string) int64 {
@@ -386,7 +526,21 @@ func (e *Engine) PubSubPublish(channel, message string) int64 {
 	defer e.pubsubMu.RUnlock()
 
 	count := int64(0)
-	
+
+	if strings.HasPrefix(channel, "__shard:") {
+		realCh := channel[len("__shard:"):]
+		if subs, ok := e.pubsubSubs[channel]; ok {
+			for _, ch := range subs {
+				select {
+				case ch <- api.PubSubMessage{Channel: realCh, Message: message, Pattern: "__shard"}:
+					count++
+				default:
+				}
+			}
+		}
+		return count
+	}
+
 	// Exact matches
 	if subs, ok := e.pubsubSubs[channel]; ok {
 		for _, ch := range subs {
@@ -492,56 +646,186 @@ func (e *Engine) NotifyKeyspaceEvent(event, key string) {
 	e.notifyKeyspaceEventWithDB(0, event, key)
 }
 
-// Checkpoint creates a full snapshot of all data across all DBs.
-func (e *Engine) Checkpoint() error {
+// Checkpoint creates a consistent snapshot of all databases and records the
+// sealed WAL segment included in it. Recovery replays only newer segments.
+func (e *Engine) Checkpoint() (err error) {
+	if e.isClosed() {
+		return errEngineClosed
+	}
+
+	// Serialize snapshots so that manual, scheduled, and rewrite checkpoints
+	// cannot rotate the WAL concurrently.
+	e.checkpointMu.Lock()
+	defer e.checkpointMu.Unlock()
+	if e.isClosed() {
+		return errEngineClosed
+	}
+
+	atomic.StoreInt32(&e.checkpointInFlight, 1)
+	defer func() {
+		atomic.StoreInt32(&e.checkpointInFlight, 0)
+		e.recordCheckpointOutcome(err)
+	}()
+
+	return e.checkpointLocked()
+}
+
+func (e *Engine) checkpointLocked() error {
 	cpDir := filepath.Join(e.dataDir, "checkpoint")
-	w, err := checkpoint.NewWriter(cpDir)
+
+	// Writers take striped write locks, so this prevents every mutation while
+	// the WAL boundary is sealed and the snapshot is serialized.
+	concurrency.GlobalLocker.LockAll(false)
+	defer concurrency.GlobalLocker.UnlockAll(false)
+
+	var cutoff uint64
+	if e.wal != nil {
+		var err error
+		cutoff, err = e.wal.Rotate()
+		if err != nil {
+			return fmt.Errorf("checkpoint: rotate WAL: %w", err)
+		}
+	}
+
+	w, err := checkpoint.NewWriterWithMetadata(cpDir, checkpoint.Metadata{WALCutoff: cutoff})
 	if err != nil {
 		return err
 	}
 
 	var skipped int
+	var writeErr error
 	for dbIdx := 0; dbIdx < NumDBs; dbIdx++ {
 		for i := 0; i < 256; i++ {
 			e.dbs[dbIdx].shards[i].ForEach(func(key string, obj *object.Object) {
+				if writeErr != nil {
+					return
+				}
 				rec, serErr := serializeObject(key, obj)
 				if serErr != nil {
 					skipped++
 					logger.Warn("checkpoint: skip key", "key", key, "error", serErr)
 					return
 				}
-				w.WriteRecord(rec)
+				rec.DB = uint8(dbIdx)
+				if err := w.WriteRecord(rec); err != nil {
+					writeErr = err
+				}
 			})
 		}
+	}
+	if writeErr != nil {
+		_ = w.Abort()
+		return fmt.Errorf("checkpoint: write record: %w", writeErr)
 	}
 	if skipped > 0 {
 		logger.Warn("checkpoint: skipped keys", "count", skipped)
 	}
-
-	return w.Close()
+	if err := w.Close(); err != nil {
+		return err
+	}
+	if e.wal != nil {
+		if err := e.wal.PruneThrough(cutoff); err != nil {
+			// The published cutoff makes retained files harmless. Report cleanup
+			// failure without invalidating an otherwise durable checkpoint.
+			logger.Warn("checkpoint: prune WAL", "error", err)
+		}
+	}
+	return nil
 }
 
 func (e *Engine) checkpointLoop(interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	for range ticker.C {
-		if err := e.Checkpoint(); err != nil {
-			logger.Error("auto-checkpoint failed", "error", err)
+	for {
+		select {
+		case <-e.persistenceStopCh:
+			return
+		case <-ticker.C:
+			if e.isClosed() {
+				return
+			}
+			if err := e.Checkpoint(); err != nil && !e.isClosed() {
+				logger.Error("auto-checkpoint failed", "error", err)
+			}
 		}
 	}
 }
 
-// Close flushes the WAL
+// Close stops all persistence workers before closing the WAL. It is safe to
+// call repeatedly; every caller receives the result of the first close.
 func (e *Engine) Close() error {
-	// Stop active expire loop
-	if e.expireStopCh != nil {
-		close(e.expireStopCh)
-		e.expireWg.Wait()
+	e.closeOnce.Do(func() {
+		// Prevent new background workers from being registered, signal existing
+		// ones, then wait for active checkpoints or rewrites to finish.
+		e.persistenceMu.Lock()
+		atomic.StoreInt32(&e.closed, 1)
+		if e.persistenceStopCh != nil {
+			close(e.persistenceStopCh)
+		}
+		e.persistenceMu.Unlock()
+		e.persistenceWg.Wait()
+
+		// A direct/manual checkpoint may not be a tracked worker. Waiting on
+		// this mutex guarantees it cannot still rotate the WAL during close.
+		e.checkpointMu.Lock()
+		e.checkpointMu.Unlock()
+
+		if e.expireStopCh != nil {
+			close(e.expireStopCh)
+			e.expireWg.Wait()
+		}
+		if e.wal != nil {
+			e.closeErr = e.wal.Close()
+		}
+	})
+	return e.closeErr
+}
+
+func (e *Engine) isClosed() bool {
+	return atomic.LoadInt32(&e.closed) != 0
+}
+
+func (e *Engine) startPersistenceWorker(fn func()) bool {
+	e.persistenceMu.Lock()
+	defer e.persistenceMu.Unlock()
+	if e.isClosed() || e.persistenceStopCh == nil {
+		return false
 	}
-	if e.wal != nil {
-		return e.wal.Close()
+	e.persistenceWg.Add(1)
+	go func() {
+		defer e.persistenceWg.Done()
+		fn()
+	}()
+	return true
+}
+
+func (e *Engine) recordCheckpointOutcome(err error) {
+	e.checkpointStatusMu.Lock()
+	defer e.checkpointStatusMu.Unlock()
+	if err != nil {
+		e.lastCheckpointErr = err.Error()
+		e.checkpointFailures++
+		return
 	}
-	return nil
+	e.lastCheckpointAt = time.Now()
+	e.lastCheckpointErr = ""
+	e.checkpointSuccesses++
+}
+
+// CheckpointStatus returns the most recent checkpoint result and live state.
+func (e *Engine) CheckpointStatus() CheckpointStatus {
+	e.checkpointStatusMu.RLock()
+	defer e.checkpointStatusMu.RUnlock()
+	status := CheckpointStatus{
+		InProgress:   atomic.LoadInt32(&e.checkpointInFlight) != 0,
+		LastError:    e.lastCheckpointErr,
+		SuccessCount: e.checkpointSuccesses,
+		FailureCount: e.checkpointFailures,
+	}
+	if !e.lastCheckpointAt.IsZero() {
+		status.LastSuccessUnixMilli = e.lastCheckpointAt.UnixMilli()
+	}
+	return status
 }
 
 // startActiveExpireLoop starts a background goroutine that periodically
@@ -579,38 +863,59 @@ func (e *Engine) runActiveExpireCycle() {
 		for shardIdx := 0; shardIdx < 256 && checked < maxCheckPerCycle; shardIdx++ {
 			shard := e.dbs[dbIdx].shards[shardIdx]
 
+			sampleKeys := shard.SampleKeys(20)
+			if len(sampleKeys) == 0 {
+				continue
+			}
+
 			// Expire whole keys first.
-			for _, key := range shard.KeysAll() {
+			for _, key := range sampleKeys {
 				if checked >= maxCheckPerCycle {
 					break
 				}
+				unlock := concurrency.GlobalLocker.LockKeys([]string{key}, true)
 				obj, ok := shard.GetRaw(key)
 				if !ok || obj == nil {
+					unlock()
 					continue
 				}
 				if obj.ExpireAt <= 0 || obj.ExpireAt > nowMs {
+					unlock()
 					continue
 				}
 				if shard.Del(key) {
 					e.Notifier.Notify(dbIdx, keyevent.FlagExpired, "expired", key)
 				}
 				checked++
+				unlock()
 			}
 			if checked >= maxCheckPerCycle {
 				break
 			}
 
 			// Then scan hash-field expirations.
-			shard.ForEach(func(key string, obj *object.Object) {
-				if checked >= maxCheckPerCycle {
-					return
+			var hashKeys []string
+			for _, key := range sampleKeys {
+				obj, ok := shard.GetRaw(key)
+				if ok && obj != nil && obj.Type == object.TypeHash {
+					hashKeys = append(hashKeys, key)
 				}
-				if obj.Type != object.TypeHash {
-					return
+			}
+
+			for _, key := range hashKeys {
+				if checked >= maxCheckPerCycle {
+					break
+				}
+				unlock := concurrency.GlobalLocker.LockKeys([]string{key}, true)
+				obj, ok := shard.GetRaw(key)
+				if !ok || obj == nil || obj.Type != object.TypeHash {
+					unlock()
+					continue
 				}
 				h, ok := obj.Value.(*object.Hash)
 				if !ok || h.TTLs == nil || len(h.TTLs) == 0 {
-					return
+					unlock()
+					continue
 				}
 
 				var expired []string
@@ -620,7 +925,8 @@ func (e *Engine) runActiveExpireCycle() {
 					}
 				}
 				if len(expired) == 0 {
-					return
+					unlock()
+					continue
 				}
 
 				for _, field := range expired {
@@ -630,22 +936,42 @@ func (e *Engine) runActiveExpireCycle() {
 
 				// Send hexpired notification (at most one per hash per cycle).
 				e.Notifier.Notify(dbIdx, keyevent.FlagHash, "hexpired", key)
+				e.Notifier.NotifySubkey(dbIdx, keyevent.FlagHash, "hexpired", key, expired)
 
 				// If hash is empty, delete it and send del notification
 				if h.Len() == 0 {
-					e.Del(key)
+					shard.Del(key)
 					e.Notifier.Notify(dbIdx, keyevent.FlagGeneric, "del", key)
 				}
-			})
+				unlock()
+			}
 		}
 	}
 }
 
-// replayEntry replays a single WAL entry (re-applies the command to memory)
+// replayEntry replays a single WAL entry into the database encoded by its
+// versioned command frame. Legacy frames implicitly target DB 0.
 func (e *Engine) replayEntry(entry wal.Entry) {
-	buf := entry.Command
-	if len(buf) < 2 {
+	db, args, ok := decodeWALCommand(entry.Command)
+	if !ok || db < 0 || db >= NumDBs || len(args) == 0 {
 		return
+	}
+	applyCommand(e.dbs[db], args, entry.Timestamp)
+}
+
+func decodeWALCommand(buf []byte) (int, [][]byte, bool) {
+	db := 0
+	if len(buf) >= 7 && string(buf[:4]) == string(walCommandMagic[:]) {
+		if buf[4] != walCommandVersion {
+			logger.Warn("recovery: unsupported WAL command version", "version", buf[4])
+			return 0, nil, false
+		}
+		db = int(buf[5])
+		buf = buf[6:]
+	}
+	if len(buf) < 2 {
+		logger.Warn("recovery: truncated WAL entry")
+		return 0, nil, false
 	}
 	nargs := binary.LittleEndian.Uint16(buf[:2])
 	buf = buf[2:]
@@ -654,22 +980,18 @@ func (e *Engine) replayEntry(entry wal.Entry) {
 	for i := 0; i < int(nargs); i++ {
 		if len(buf) < 4 {
 			logger.Warn("recovery: truncated WAL entry")
-			return
+			return 0, nil, false
 		}
 		length := binary.LittleEndian.Uint32(buf[:4])
 		buf = buf[4:]
 		if uint32(len(buf)) < length {
 			logger.Warn("recovery: truncated WAL entry")
-			return
+			return 0, nil, false
 		}
 		args = append(args, buf[:length])
 		buf = buf[length:]
 	}
-
-	if len(args) == 0 {
-		return
-	}
-	applyCommand(e, args)
+	return db, args, true
 }
 
 // touchObject updates access tracking based on eviction policy.
@@ -703,7 +1025,7 @@ func estimateSize(obj *object.Object) int64 {
 	base := int64(64) // Object struct overhead
 	switch obj.Type {
 	case object.TypeString:
-		if s, ok := obj.Value.(string); ok {
+		if s, ok := obj.Value.([]byte); ok {
 			return base + int64(len(s))
 		}
 	case object.TypeList:
@@ -765,59 +1087,69 @@ func (e *Engine) SetEvictionConfig(ecfg api.EvictionConfig) {
 	e.Evictor.SetConfig(cfg)
 }
 
-// SaveRDB exports the live in-memory state of DB 0 to an RDB file.
+// SaveRDB exports every logical database to an atomic RDB snapshot.
 func (e *Engine) SaveRDB(path string) (int, error) {
-	exp := rdb.NewExporter(e.dbs[0].shards)
-	return exp.ExportFile(path)
-}
+	concurrency.GlobalLocker.LockAll(false)
+	defer concurrency.GlobalLocker.UnlockAll(false)
 
-// LoadRDB imports keys from an RDB file into DB 0.
-func (e *Engine) LoadRDB(path string) (int, error) {
-	imp := rdb.NewImporter(e.dbs[0].shards)
-	return imp.ImportFile(path)
-}
-
-// RewriteAOF performs a synchronous AOF rewrite:
-// 1. Creates a checkpoint of all data
-// 2. Truncates the WAL
-// 3. Cleans up old checkpoint files
-// This is equivalent to Redis's BGREWRITEAOF but synchronous.
-func (e *Engine) RewriteAOF() error {
-	if e.wal == nil {
-		return nil // persistence not enabled
+	databases := make([][256]*shard.Shard, NumDBs)
+	for dbIdx := 0; dbIdx < NumDBs; dbIdx++ {
+		databases[dbIdx] = e.dbs[dbIdx].shards
 	}
+	return rdb.NewMultiExporter(databases).ExportFile(path)
+}
 
-	// Step 1: Create checkpoint
+// LoadRDB imports every database encoded in an RDB file.
+func (e *Engine) LoadRDB(path string) (int, error) {
+	concurrency.GlobalLocker.LockAll(true)
+	defer concurrency.GlobalLocker.UnlockAll(true)
+
+	databases := make([][256]*shard.Shard, NumDBs)
+	for dbIdx := 0; dbIdx < NumDBs; dbIdx++ {
+		databases[dbIdx] = e.dbs[dbIdx].shards
+	}
+	return rdb.NewMultiImporter(databases).ImportFile(path)
+}
+
+// RewriteAOF creates a fresh checkpoint and removes superseded snapshots.
+// Checkpoint itself seals and prunes WAL segments with a durable cutoff; do not
+// truncate current.wal here because it may already contain post-snapshot writes.
+func (e *Engine) RewriteAOF() error {
+	if e.isClosed() {
+		return errEngineClosed
+	}
+	if e.wal == nil {
+		return nil
+	}
 	if err := e.Checkpoint(); err != nil {
 		return err
 	}
-
-	// Step 2: Truncate WAL (entries are now in checkpoint)
-	if err := e.wal.Truncate(); err != nil {
-		return err
-	}
-
-	// Step 3: Clean up old checkpoints
 	cpDir := filepath.Join(e.dataDir, "checkpoint")
-	checkpoint.CleanupOldCheckpoints(cpDir)
-
+	_, _ = checkpoint.CleanupOldCheckpoints(cpDir)
 	return nil
 }
 
 // RewriteAOFAsync performs an asynchronous AOF rewrite in the background.
 func (e *Engine) RewriteAOFAsync() error {
+	if e.isClosed() {
+		return errEngineClosed
+	}
 	if e.wal == nil {
 		return nil
 	}
-	go func() {
+	if !e.startPersistenceWorker(func() {
 		atomic.StoreInt32(&e.aofRewriteInProgress, 1)
 		defer atomic.StoreInt32(&e.aofRewriteInProgress, 0)
 		if err := e.RewriteAOF(); err != nil {
-			logger.Error("background AOF rewrite failed", "error", err)
-		} else {
-			logger.Info("background AOF rewrite completed")
+			if !e.isClosed() {
+				logger.Error("background AOF rewrite failed", "error", err)
+			}
+			return
 		}
-	}()
+		logger.Info("background AOF rewrite completed")
+	}) {
+		return errEngineClosed
+	}
 	return nil
 }
 
@@ -826,38 +1158,47 @@ func (e *Engine) AOFRewriteInProgress() int {
 	return int(atomic.LoadInt32(&e.aofRewriteInProgress))
 }
 
-// LoadAOF reloads state from checkpoint + WAL files (DEBUG LOADAOF).
+// LoadAOF reloads all databases from checkpoint plus WAL files (DEBUG LOADAOF).
 func (e *Engine) LoadAOF() error {
 	if e.dataDir == "" {
 		return nil
 	}
 
-	// Recover from checkpoint + WAL
+	// Block all mutations for the complete replacement. The recovery read is
+	// included so a concurrent write cannot be lost between recovery and flush.
+	concurrency.GlobalLocker.LockAll(true)
+	defer concurrency.GlobalLocker.UnlockAll(true)
+	if e.wal != nil {
+		if err := e.wal.Sync(); err != nil {
+			return fmt.Errorf("load AOF: sync WAL: %w", err)
+		}
+	}
+
 	state, err := recovery.Recover(recovery.Options{DataDir: e.dataDir})
 	if err != nil {
 		return err
 	}
-
-	// Flush current DB 0
-	for i := 0; i < 256; i++ {
-		e.dbs[0].shards[i].Flush()
+	for dbIdx := 0; dbIdx < NumDBs; dbIdx++ {
+		for i := 0; i < 256; i++ {
+			e.dbs[dbIdx].shards[i].Flush()
+		}
 	}
 
-	// Load checkpoint records
 	for _, rec := range state.Records {
-		obj, err := deserializeObject(rec)
-		if err != nil {
+		if int(rec.DB) >= NumDBs {
+			logger.Warn("recovery: skip key with invalid database", "key", rec.Key, "db", rec.DB)
 			continue
 		}
-		s := e.dbs[0].getShard(rec.Key)
-		s.Set(rec.Key, obj)
+		obj, err := deserializeObject(rec)
+		if err != nil {
+			logger.Warn("recovery: skip key", "key", rec.Key, "error", err)
+			continue
+		}
+		e.dbs[rec.DB].getShard(rec.Key).Set(rec.Key, obj)
 	}
-
-	// Replay WAL entries
 	for _, entry := range state.WALEntries {
 		e.replayEntry(entry)
 	}
-
 	return nil
 }
 
@@ -1046,7 +1387,7 @@ func (e *Engine) SwapDB(db1, db2 int) error {
 		v2.shards[i].LockForSwap()
 	}
 	for i := 0; i < 256; i++ {
-		v1.shards[i], v2.shards[i] = v2.shards[i], v1.shards[i]
+		v1.shards[i].SwapData(v2.shards[i])
 	}
 	for i := 255; i >= 0; i-- {
 		v2.shards[i].UnlockForSwap()
@@ -1055,10 +1396,13 @@ func (e *Engine) SwapDB(db1, db2 int) error {
 
 	// Wake blocked clients on both databases — the swap may have made
 	// data available in keys they were waiting on.
+	var keys1, keys2 []string
 	for i := 0; i < 256; i++ {
-		e.dbs[db1].shards[i].SignalAllBlocked()
-		e.dbs[db2].shards[i].SignalAllBlocked()
+		keys1 = append(keys1, v1.shards[i].WaiterKeys()...)
+		keys2 = append(keys2, v2.shards[i].WaiterKeys()...)
 	}
+	v1.FlushSignals(keys1)
+	v2.FlushSignals(keys2)
 
 	return nil
 }
@@ -1090,4 +1434,31 @@ func (e *Engine) DBSize(db int) int {
 		total += v.shards[i].Len()
 	}
 	return total
+}
+
+// PersistenceStatus exposes live WAL durability and I/O health to operational
+// surfaces such as INFO. In-memory engines report persistence as disabled.
+func (e *Engine) PersistenceStatus() wal.Status {
+	if e.wal == nil {
+		return wal.Status{FsyncMode: wal.FsyncEverySec, Healthy: true}
+	}
+	return e.wal.Status()
+}
+
+// PersistenceEnabled reports whether this engine currently writes a WAL.
+func (e *Engine) PersistenceEnabled() bool {
+	return e.wal != nil
+}
+
+// WALWriteAdmission reports whether mutating commands may execute under the
+// active WAL failure policy. Read-only commands are intentionally unaffected.
+func (e *Engine) WALWriteAdmission() (bool, string) {
+	policy := e.walFailurePolicy
+	if policy == "" {
+		policy = WALFailureStopWrites
+	}
+	if e.wal == nil || policy == WALFailureContinue {
+		return true, string(policy)
+	}
+	return e.wal.Status().Healthy, string(policy)
 }

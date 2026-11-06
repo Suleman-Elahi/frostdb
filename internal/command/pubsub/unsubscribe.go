@@ -36,10 +36,14 @@ func (c UnsubscribeCommand) Execute(ctx *context.Context, args []types.Value) ty
 			{Type: types.TypeBulkString, IsNull: true},
 			types.NewInt(int64(len(ctx.PatternSubs))),
 		})
+		if ctx.ExecutingMulti {
+			return reply
+		}
 		encoder.Encode(ctx.Conn, reply)
 		return types.Value{Type: types.TypeNoReply}
 	}
 
+	var lastReply types.Value
 	for _, channel := range channelsToUnsubscribe {
 		if cleanup, exists := ctx.Subscriptions[channel]; exists {
 			cleanup()
@@ -51,11 +55,18 @@ func (c UnsubscribeCommand) Execute(ctx *context.Context, args []types.Value) ty
 			types.NewString(channel),
 			types.NewInt(int64(len(ctx.Subscriptions) + len(ctx.PatternSubs))),
 		})
-		encoder.Encode(ctx.Conn, reply)
+		lastReply = reply
+		if !ctx.ExecutingMulti || len(channelsToUnsubscribe) > 1 {
+			encoder.Encode(ctx.Conn, reply)
+		}
 	}
 
-	if len(ctx.Subscriptions) == 0 && len(ctx.PatternSubs) == 0 {
+	if len(ctx.Subscriptions) == 0 && len(ctx.PatternSubs) == 0 && len(ctx.ShardSubs) == 0 {
 		ctx.PubSubMode = false
+	}
+
+	if ctx.ExecutingMulti && len(channelsToUnsubscribe) == 1 {
+		return lastReply
 	}
 
 	return types.Value{Type: types.TypeNoReply}

@@ -43,8 +43,8 @@ func (c DumpCommand) Execute(ctx *context.Context, args []types.Value) types.Val
 	var err error
 	switch obj.Type {
 	case object.TypeString:
-		val, _ := obj.Value.(string)
-		err = enc.WriteStringObject(key, []byte(val))
+		val, _ := obj.Value.([]byte)
+		err = enc.WriteStringObject(key, val)
 	case object.TypeList:
 		l := obj.Value.(*object.List)
 		values := l.Snapshot()

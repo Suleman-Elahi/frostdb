@@ -1,6 +1,7 @@
 package str
 
 import (
+	"bytes"
 	"strings"
 
 	"frostdb/internal/engine/object"
@@ -112,19 +113,19 @@ func (c DelexCommand) Execute(ctx *context.Context, args []types.Value) types.Va
 		}
 	}
 
-	strVal, _ := obj.Value.(string)
+	strVal, _ := obj.Value.([]byte)
 
 	// ── Evaluate condition ─────────────────────────────────────────────────
 	var shouldDelete bool
 	switch cond {
 	case DelexIFEQ:
-		shouldDelete = strVal == string(condArg)
+		shouldDelete = bytes.Equal(strVal, condArg)
 	case DelexIFNE:
-		shouldDelete = strVal != string(condArg)
+		shouldDelete = !bytes.Equal(strVal, condArg)
 	case DelexIFDEQ:
-		shouldDelete = digestString(strVal) == condDigest
+		shouldDelete = digestStringBytes(strVal) == condDigest
 	case DelexIFDNE:
-		shouldDelete = digestString(strVal) != condDigest
+		shouldDelete = digestStringBytes(strVal) != condDigest
 	}
 
 	if shouldDelete {

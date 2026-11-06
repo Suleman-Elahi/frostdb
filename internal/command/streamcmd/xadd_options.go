@@ -36,6 +36,7 @@ func parseXAddOptions(args []types.Value, start int) (xaddOptions, int, types.Va
 		},
 	}
 	idx := start
+	hasPolicy := false
 
 	for idx < len(args) {
 		switch strings.ToUpper(string(args[idx].Str)) {
@@ -56,8 +57,24 @@ func parseXAddOptions(args []types.Value, start int) (xaddOptions, int, types.Va
 				return opts, idx, types.NewError("ERR syntax error"), false
 			}
 			opts.trim.threshold = string(args[idx].Str)
+			if opts.trim.strategy == "MAXLEN" {
+				maxlen, err := strconv.Atoi(opts.trim.threshold)
+				if err != nil {
+					return opts, idx, types.NewError("ERR value is not an integer or out of range"), false
+				}
+				if maxlen < 0 {
+					return opts, idx, types.NewError("ERR The MAXLEN argument must be >= 0."), false
+				}
+			} else {
+				if _, err := object.ParseStreamID(opts.trim.threshold); err != nil {
+					return opts, idx, types.NewError("ERR Invalid stream ID specified as stream command argument"), false
+				}
+			}
 			idx++
 		case "LIMIT":
+			if !opts.trim.approx {
+				return opts, idx, types.NewError("ERR syntax error, LIMIT cannot be used without the special ~ option"), false
+			}
 			if idx+1 >= len(args) {
 				return opts, idx, types.NewError("ERR syntax error"), false
 			}
@@ -105,13 +122,25 @@ func parseXAddOptions(args []types.Value, start int) (xaddOptions, int, types.Va
 			}
 			idx += 2
 		case "KEEPREF":
+			if hasPolicy {
+				return opts, idx, types.NewError("ERR syntax error, only one of KEEPREF, DELREF, or ACKED can be specified"), false
+			}
 			opts.trim.refPolicy = object.StreamTrimKeepRef
+			hasPolicy = true
 			idx++
 		case "DELREF":
+			if hasPolicy {
+				return opts, idx, types.NewError("ERR syntax error, only one of KEEPREF, DELREF, or ACKED can be specified"), false
+			}
 			opts.trim.refPolicy = object.StreamTrimDelRef
+			hasPolicy = true
 			idx++
 		case "ACKED":
+			if hasPolicy {
+				return opts, idx, types.NewError("ERR syntax error, only one of KEEPREF, DELREF, or ACKED can be specified"), false
+			}
 			opts.trim.refPolicy = object.StreamTrimAcked
+			hasPolicy = true
 			idx++
 		default:
 			return opts, idx, types.Value{}, true

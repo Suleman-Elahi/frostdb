@@ -2,12 +2,13 @@ package core
 
 import (
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"frostdb/internal/engine/api"
 	"frostdb/internal/engine/object"
-	"frostdb/internal/engine/rdb"
+	"frostdb/internal/engine/persistence/wal"
 	"frostdb/internal/engine/shard"
 	"frostdb/internal/stats"
 )
@@ -235,7 +236,27 @@ func (v *DBView) KeysAll(pattern string) []string {
 }
 
 func (v *DBView) Subscribe(keys []string) (<-chan struct{}, func()) {
+	w, cleanup := v.SubscribeWaiter(keys)
 	ch := make(chan struct{}, 1)
+	go func() {
+		for {
+			select {
+			case ackCh := <-w.WakeCh:
+				select {
+				case ch <- struct{}{}:
+				default:
+				}
+				ackCh <- shard.SignalAck{Consumed: true}
+			case <-w.DoneCh:
+				return
+			}
+		}
+	}()
+	return ch, cleanup
+}
+
+func (v *DBView) SubscribeWaiter(keys []string) (*shard.Waiter, func()) {
+	w := shard.NewWaiter()
 	seen := make(map[string]struct{}, len(keys))
 	for _, key := range keys {
 		if _, ok := seen[key]; ok {
@@ -243,23 +264,71 @@ func (v *DBView) Subscribe(keys []string) (<-chan struct{}, func()) {
 		}
 		seen[key] = struct{}{}
 		s := v.getShard(key)
-		s.Subscribe(key, ch)
+		s.SubscribeWaiter(key, w)
 	}
+	var unsubOnce sync.Once
 	cleanup := func() {
-		for key := range seen {
-			s := v.getShard(key)
-			s.Unsubscribe(key, ch)
-		}
+		unsubOnce.Do(func() {
+			w.CloseDone()
+			for key := range seen {
+				s := v.getShard(key)
+				s.UnsubscribeWaiter(key, w)
+			}
+		})
 	}
-	return ch, cleanup
+	return w, cleanup
+}
+
+func (v *DBView) FlushSignals(initialKeys []string) {
+	if len(initialKeys) == 0 {
+		return
+	}
+	queue := make([]string, len(initialKeys))
+	copy(queue, initialKeys)
+
+	for len(queue) > 0 {
+		key := queue[0]
+		queue = queue[1:]
+
+		if v.engine.onTouchCb != nil {
+			v.engine.onTouchCb(key)
+		}
+
+		s := v.getShard(key)
+		ws := s.WaitersSnapshot(key)
+		for _, w := range ws {
+			ackCh := make(chan shard.SignalAck, 1)
+			select {
+			case w.WakeCh <- ackCh:
+				var ack shard.SignalAck
+				var gotAck bool
+				select {
+				case ack = <-ackCh:
+					gotAck = true
+				case <-w.DoneCh:
+					select {
+					case ack = <-ackCh:
+						gotAck = true
+					default:
+					}
+				}
+				if gotAck {
+					if len(ack.Cascaded) > 0 {
+						queue = append(queue, ack.Cascaded...)
+					}
+					if !ack.Consumed || !s.HasKey(key) {
+						goto nextKey
+					}
+				}
+			case <-w.DoneCh:
+			}
+		}
+	nextKey:
+	}
 }
 
 func (v *DBView) SignalKey(key string) {
-	s := v.getShard(key)
-	s.Signal(key)
-	if v.engine.onTouchCb != nil {
-		v.engine.onTouchCb(key)
-	}
+	v.FlushSignals([]string{key})
 }
 
 // Shards returns the shard array for this DB (used by RDB export/import, checkpoint).
@@ -289,6 +358,14 @@ func (v *DBView) PubSubNumPat() int64 {
 	return v.engine.PubSubNumPat()
 }
 
+func (v *DBView) CheckPubSubOOM(argBytes int64) bool {
+	return v.engine.CheckPubSubOOM(argBytes)
+}
+
+func (v *DBView) PubSubChannels(pattern string, shard bool) []string {
+	return v.engine.PubSubChannels(pattern, shard)
+}
+
 func (v *DBView) NotifyKeyspaceEvent(event, key string) {
 	v.engine.notifyKeyspaceEventWithDB(v.db, event, key)
 }
@@ -306,13 +383,11 @@ func (v *DBView) SetEvictionConfig(cfg api.EvictionConfig) {
 }
 
 func (v *DBView) SaveRDB(path string) (int, error) {
-	exp := rdb.NewExporter(v.shards)
-	return exp.ExportFile(path)
+	return v.engine.SaveRDB(path)
 }
 
 func (v *DBView) LoadRDB(path string) (int, error) {
-	imp := rdb.NewImporter(v.shards)
-	return imp.ImportFile(path)
+	return v.engine.LoadRDB(path)
 }
 
 func (v *DBView) RewriteAOF() error {
@@ -365,6 +440,14 @@ func (v *DBView) GetDirty() int64 {
 	return v.engine.GetDirty()
 }
 
+func (v *DBView) AddDirty(n int64) {
+	v.engine.AddDirty(n)
+}
+
+func (v *DBView) ResetDirty() {
+	v.engine.ResetDirty()
+}
+
 // ParentEngine returns the underlying Engine (used for admin operations like RDB import/export).
 func (v *DBView) ParentEngine() *Engine {
 	return v.engine
@@ -402,4 +485,25 @@ func (v *DBView) FlushDB(db int) {
 // DBSize returns the number of keys in the given database.
 func (v *DBView) DBSize(db int) int {
 	return v.engine.DBSize(db)
+}
+
+// PersistenceStatus exposes the parent engine's WAL health without expanding
+// the command-facing Engine interface used by lightweight test engines.
+func (v *DBView) PersistenceStatus() wal.Status {
+	return v.engine.PersistenceStatus()
+}
+
+// PersistenceEnabled reports whether the parent engine has an active WAL.
+func (v *DBView) PersistenceEnabled() bool {
+	return v.engine.PersistenceEnabled()
+}
+
+// WALWriteAdmission delegates the active WAL write policy and admission state.
+func (v *DBView) WALWriteAdmission() (bool, string) {
+	return v.engine.WALWriteAdmission()
+}
+
+// CheckpointStatus exposes the parent engine's latest checkpoint outcome.
+func (v *DBView) CheckpointStatus() CheckpointStatus {
+	return v.engine.CheckpointStatus()
 }

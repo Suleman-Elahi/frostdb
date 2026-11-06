@@ -28,10 +28,16 @@ const (
 	UnblockError
 )
 
+type clientUnblockEntry struct {
+	ch   chan UnblockType
+	done chan struct{}
+	once sync.Once
+}
+
 // clientStates tracks connected clients for CLIENT LIST.
 var clientStates sync.Map
 
-// clientUnblockChs maps client ID to unblock channel.
+// clientUnblockChs maps client ID to *clientUnblockEntry.
 var clientUnblockChs sync.Map
 
 // RegisterClient adds a client to the tracking map.
@@ -85,12 +91,20 @@ func UpdateClientLastCmd(ctx *context.Context, cmd string) {
 
 // RegisterClientUnblockCh registers a client's unblock channel for CLIENT UNBLOCK.
 func RegisterClientUnblockCh(clientID int, ch chan UnblockType) {
-	clientUnblockChs.Store(clientID, ch)
+	clientUnblockChs.Store(clientID, &clientUnblockEntry{
+		ch:   ch,
+		done: make(chan struct{}),
+	})
 }
 
-// UnregisterClientUnblockCh removes a client's unblock channel.
+// UnregisterClientUnblockCh removes a client's unblock channel and notifies any waiting CLIENT UNBLOCK caller.
 func UnregisterClientUnblockCh(clientID int) {
-	clientUnblockChs.Delete(clientID)
+	if v, ok := clientUnblockChs.LoadAndDelete(clientID); ok {
+		entry := v.(*clientUnblockEntry)
+		entry.once.Do(func() {
+			close(entry.done)
+		})
+	}
 }
 
 // UnblockClientByID unblocks a client by its ID. Returns 1 if the client was
@@ -100,13 +114,14 @@ func UnblockClientByID(clientID int, errorMode bool) int {
 	if !ok {
 		return 0
 	}
-	ch := chVal.(chan UnblockType)
+	entry := chVal.(*clientUnblockEntry)
 	unblockType := UnblockNormal
 	if errorMode {
 		unblockType = UnblockError
 	}
 	select {
-	case ch <- unblockType:
+	case entry.ch <- unblockType:
+		<-entry.done
 		return 1
 	default:
 		return 0
@@ -233,6 +248,13 @@ func (c ClientCommand) Execute(ctx *context.Context, args []types.Value) types.V
 		}
 		unblocked := UnblockClientByID(targetID, errorMode)
 		return types.NewInt(int64(unblocked))
+	case "PAUSE":
+		if len(args) < 2 {
+			return types.NewError("ERR wrong number of arguments for 'client|pause' command")
+		}
+		return types.NewSimpleString("OK")
+	case "UNPAUSE":
+		return types.NewSimpleString("OK")
 	default:
 		return types.NewError("ERR unknown subcommand '" + strings.ToLower(sub) + "'")
 	}

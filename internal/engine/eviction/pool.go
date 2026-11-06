@@ -241,7 +241,7 @@ func estimateObjectSize(obj *object.Object) int64 {
 	base := int64(64)
 	switch obj.Type {
 	case object.TypeString:
-		if s, ok := obj.Value.(string); ok {
+		if s, ok := obj.Value.([]byte); ok {
 			return base + int64(len(s))
 		}
 		return base + 64

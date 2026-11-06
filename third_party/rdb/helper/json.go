@@ -23,6 +23,7 @@ func WithConcurrent(c int) ConcurrentOption {
 }
 
 // ToJsons read rdb file and convert to json file
+
 func ToJsons(rdbFilename string, jsonFilename string, options ...interface{}) error {
 	if rdbFilename == "" {
 		return errors.New("src file path is required")
@@ -56,7 +57,7 @@ func ToJsons(rdbFilename string, jsonFilename string, options ...interface{}) er
 		return fmt.Errorf("write json  failed, %v", err)
 	}
 
-	// parse options
+	
 	concurrent := 1
 	cpuNum := runtime.NumCPU()
 	if cpuNum > 1 {

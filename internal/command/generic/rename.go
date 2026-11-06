@@ -31,8 +31,8 @@ func (c RenameCommand) Execute(ctx *context.Context, args []types.Value) types.V
 	}
 	ctx.Engine.Del(src)
 	ctx.Engine.Set(dst, obj)
-	ctx.Engine.SignalKey(src)
-	ctx.Engine.SignalKey(dst)
+	ctx.SignalKey(src)
+	ctx.SignalKey(dst)
 	return types.RespOK
 }
 
@@ -59,7 +59,7 @@ func (c RenameNXCommand) Execute(ctx *context.Context, args []types.Value) types
 
 	ctx.Engine.Del(src)
 	ctx.Engine.Set(dst, obj)
-	ctx.Engine.SignalKey(src)
-	ctx.Engine.SignalKey(dst)
+	ctx.SignalKey(src)
+	ctx.SignalKey(dst)
 	return types.RespOne
 }

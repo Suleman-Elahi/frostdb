@@ -1,11 +1,8 @@
 package listcmd
 
 import (
-	"strconv"
 	"strings"
-	"time"
 
-	"frostdb/internal/blocking"
 	"frostdb/internal/command/generic"
 	"frostdb/internal/engine/object"
 	"frostdb/internal/kernel/context"
@@ -31,94 +28,44 @@ func (c BLMoveCommand) Execute(ctx *context.Context, args []types.Value) types.V
 		return types.NewError("ERR syntax error")
 	}
 
-	timeoutSecs, err := strconv.ParseFloat(string(args[4].Str), 64)
-	if err != nil || timeoutSecs < 0 {
-		return types.NewError("ERR timeout is not a float or out of range")
+	timeoutSecs, errVal := generic.ParseTimeout(args[4])
+	if errVal.Type == types.TypeError {
+		return errVal
+	}
+
+	tryMove := func() (types.Value, bool) {
+		v, sig := moveOnce(ctx, sourceKey, destKey, whereFrom, whereTo)
+		if sig {
+			ctx.SignalKey(sourceKey)
+		}
+		if v.IsNull {
+			return v, false
+		}
+		if v.Type != types.TypeError {
+			ctx.ReplicateAs = [][]byte{[]byte("LMOVE"), []byte(sourceKey), []byte(destKey), []byte(strings.ToLower(whereFrom)), []byte(strings.ToLower(whereTo))}
+		} else {
+			ctx.SkipReplication = true
+		}
+		return v, true
 	}
 
 	if ctx.ExecutingMulti || ctx.InScript {
-		v, sig := moveOnce(ctx, sourceKey, destKey, whereFrom, whereTo)
-		if sig {
-			if ctx.ExecutingMulti {
-				ctx.DeferredSignals = append(ctx.DeferredSignals, sourceKey)
-			} else {
-				ctx.Engine.SignalKey(sourceKey)
-			}
-		}
-		return v
-	}
-
-	var signalSource bool
-	defer func() {
-		if signalSource {
-			ctx.Engine.SignalKey(sourceKey)
-		}
-	}()
-
-	if v, sig := moveOnce(ctx, sourceKey, destKey, whereFrom, whereTo); !v.IsNull {
-		signalSource = sig
-		return v
-	}
-
-	waitCh, cleanup := ctx.Engine.Subscribe([]string{sourceKey})
-	defer cleanup()
-	blocking.Inc()
-	defer blocking.Dec()
-	generic.UpdateClientBlocked(ctx, true)
-	defer generic.UpdateClientBlocked(ctx, false)
-
-	unblockCh := make(chan generic.UnblockType, 1)
-	generic.RegisterClientUnblockCh(ctx.ClientID, unblockCh)
-	defer generic.UnregisterClientUnblockCh(ctx.ClientID)
-
-	var timeoutCh <-chan time.Time
-	if timeoutSecs > 0 {
-		timeoutCh = time.After(time.Duration(timeoutSecs * float64(time.Second)))
-	}
-
-	// Release the command lock before blocking.
-	if ctx.CmdMu != nil {
-		ctx.CmdMu.Unlock()
-	}
-	defer func() {
-		if ctx.CmdMu != nil {
-			ctx.CmdMu.Lock()
-		}
-	}()
-
-	for {
-		if v, sig := moveOnce(ctx, sourceKey, destKey, whereFrom, whereTo); !v.IsNull {
-			signalSource = sig
-			return v
-		}
-
-		select {
-		case <-waitCh:
-			if v, sig := moveOnce(ctx, sourceKey, destKey, whereFrom, whereTo); !v.IsNull {
-				signalSource = sig
-				return v
-			}
-		case <-timeoutCh:
+		v, ok := tryMove()
+		if !ok {
+			ctx.SkipReplication = true
 			if ctx.Protocol >= 3 {
 				return types.NewNull()
 			}
 			return types.RespNil
-		case <-ctx.Done:
-			return types.RespNil
-		case <-blocking.StopSignal():
-			if ctx.Protocol >= 3 {
-				return types.NewNull()
-			}
-			return types.RespNil
-		case ut := <-unblockCh:
-			switch ut {
-			case generic.UnblockError:
-				return types.NewError("UNBLOCKED client unblocked via CLIENT UNBLOCK")
-			default:
-				return types.RespNil
-			}
 		}
+		return v
 	}
+
+	if v, ok := tryMove(); ok {
+		return v
+	}
+
+	return blockOnListKeys(ctx, []string{sourceKey}, timeoutSecs, tryMove)
 }
 
 func moveOnce(ctx *context.Context, sourceKey, destKey, whereFrom, whereTo string) (types.Value, bool) {
@@ -157,7 +104,7 @@ func moveOnce(ctx *context.Context, sourceKey, destKey, whereFrom, whereTo strin
 			} else {
 				sourceList.PushBack(val)
 			}
-			return types.NewError("WRONGTYPE Operation against a key holding the wrong kind of value"), true
+			return types.NewError("WRONGTYPE Operation against a key holding the wrong kind of value"), false
 		}
 		destList = destObj.Value.(*object.List)
 	} else {
@@ -168,6 +115,9 @@ func moveOnce(ctx *context.Context, sourceKey, destKey, whereFrom, whereTo strin
 			Value:    destList,
 		}
 		ctx.Engine.Set(destKey, destObj)
+		// Redis only counts dirty for source key changes, not dest creation.
+		// Set adds +1; decrement it so BLMOVE totals +1 (source deletion only).
+		ctx.Engine.AddDirty(-1)
 	}
 
 	var sig bool
@@ -184,11 +134,7 @@ func moveOnce(ctx *context.Context, sourceKey, destKey, whereFrom, whereTo strin
 	} else {
 		destList.PushBack(val)
 	}
-	if ctx.ExecutingMulti {
-		ctx.DeferredSignals = append(ctx.DeferredSignals, destKey)
-	} else {
-		ctx.Engine.SignalKey(destKey)
-	}
+	ctx.SignalKey(destKey)
 
 	return types.NewString(string(val)), sig
 }

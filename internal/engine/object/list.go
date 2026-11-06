@@ -1,6 +1,49 @@
 package object
 
-import "sync"
+import (
+	"math"
+	"sync"
+	"sync/atomic"
+)
+
+var (
+	ListMaxListpackSize           atomic.Int64
+	ListCompressDepth             atomic.Int64
+	QuicklistPackedThresholdBytes atomic.Int64
+)
+
+func init() {
+	ListMaxListpackSize.Store(-2)
+}
+
+const listpackSafetyLimit = int64(8192)
+
+func listEncodingLimits() (szLimit int64, countLimit int64) {
+	fill := ListMaxListpackSize.Load()
+	if fill >= 0 {
+		if fill == 0 {
+			countLimit = 1
+		} else {
+			countLimit = fill
+		}
+		szLimit = listpackSafetyLimit
+	} else {
+		countLimit = math.MaxInt64
+		switch fill {
+		case -1:
+			szLimit = 4096
+		case -2:
+			szLimit = 8192
+		case -3:
+			szLimit = 16384
+		case -4:
+			szLimit = 32768
+		default:
+			szLimit = 65536
+		}
+	}
+	return szLimit, countLimit
+}
 
 // ListNode represents a single node in our doubly-linked list.
 type ListNode struct {
@@ -14,10 +57,12 @@ type ListNode struct {
 // Read-only traversals (Range, Index, FindPositions, Snapshot) use an RLock
 // so they can proceed concurrently with each other.
 type List struct {
-	mu   sync.RWMutex
-	Head *ListNode
-	Tail *ListNode
-	Len  int
+	mu         sync.RWMutex
+	Head       *ListNode
+	Tail       *ListNode
+	Len        int
+	TotalBytes int64
+	Quicklist  bool
 }
 
 var listNodePool = sync.Pool{
@@ -29,6 +74,42 @@ func NewList() *List {
 	return &List{}
 }
 
+func (l *List) IsQuicklist() bool {
+	l.mu.RLock()
+	q := l.Quicklist
+	l.mu.RUnlock()
+	return q
+}
+
+func (l *List) tryConvertAppendLocked(addBytes, addCount int64) {
+	if l.Quicklist {
+		return
+	}
+	szLimit, countLimit := listEncodingLimits()
+	if l.TotalBytes+addBytes >= szLimit || int64(l.Len)+addCount > countLimit {
+		l.Quicklist = true
+	}
+}
+
+func (l *List) tryConvertShrinkingLocked() {
+	if !l.Quicklist {
+		return
+	}
+	szLimit, countLimit := listEncodingLimits()
+	if int64(l.Len) <= countLimit/2 && l.TotalBytes < szLimit/2 {
+		l.Quicklist = false
+	}
+}
+
+// RecomputeEncodingAuto evaluates whether the list fits in a listpack using
+// full (non-shrinking) limits, matching Redis LIST_CONV_AUTO (e.g. RDB load).
+func (l *List) RecomputeEncodingAuto() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	szLimit, countLimit := listEncodingLimits()
+	l.Quicklist = int64(l.Len) > countLimit || l.TotalBytes >= szLimit
+}
+
 func (l *List) PushFront(val []byte) {
 	node := listNodePool.Get().(*ListNode)
 	node.Value = val
@@ -36,6 +117,7 @@ func (l *List) PushFront(val []byte) {
 	node.Next = nil
 
 	l.mu.Lock()
+	l.tryConvertAppendLocked(int64(len(val)), 1)
 	if l.Len == 0 {
 		l.Head = node
 		l.Tail = node
@@ -45,6 +127,7 @@ func (l *List) PushFront(val []byte) {
 		l.Head = node
 	}
 	l.Len++
+	l.TotalBytes += int64(len(val))
 	l.mu.Unlock()
 }
 
@@ -55,6 +138,7 @@ func (l *List) PushBack(val []byte) {
 	node.Next = nil
 
 	l.mu.Lock()
+	l.tryConvertAppendLocked(int64(len(val)), 1)
 	if l.Len == 0 {
 		l.Head = node
 		l.Tail = node
@@ -64,6 +148,7 @@ func (l *List) PushBack(val []byte) {
 		l.Tail = node
 	}
 	l.Len++
+	l.TotalBytes += int64(len(val))
 	l.mu.Unlock()
 }
 
@@ -85,6 +170,8 @@ func (l *List) PopFront() ([]byte, bool) {
 	l.Len--
 
 	val := node.Value
+	l.TotalBytes -= int64(len(val))
+	l.tryConvertShrinkingLocked()
 	node.Value = nil
 	node.Prev = nil
 	node.Next = nil
@@ -111,6 +198,8 @@ func (l *List) PopBack() ([]byte, bool) {
 	l.Len--
 
 	val := node.Value
+	l.TotalBytes -= int64(len(val))
+	l.tryConvertShrinkingLocked()
 	node.Value = nil
 	node.Prev = nil
 	node.Next = nil
@@ -162,6 +251,9 @@ func (l *List) Remove(val []byte, count int) int {
 		}
 	}
 
+	if removed > 0 {
+		l.tryConvertShrinkingLocked()
+	}
 	return removed
 }
 
@@ -179,6 +271,7 @@ func (l *List) removeNodeLocked(node *ListNode) {
 	}
 
 	l.Len--
+	l.TotalBytes -= int64(len(node.Value))
 	node.Value = nil
 	node.Prev = nil
 	node.Next = nil
@@ -229,7 +322,10 @@ func (l *List) Set(idx int, val []byte) bool {
 	for i := 0; i < idx; i++ {
 		node = node.Next
 	}
+	l.tryConvertAppendLocked(int64(len(val)), 1)
+	l.TotalBytes += int64(len(val)) - int64(len(node.Value))
 	node.Value = val
+	l.tryConvertShrinkingLocked()
 	return true
 }
 
@@ -247,6 +343,7 @@ func (l *List) Insert(pivot []byte, element []byte, before bool) int {
 	node := l.Head
 	for node != nil {
 		if bytesEqual(node.Value, pivot) {
+			l.tryConvertAppendLocked(int64(len(element)), 1)
 			newNode := listNodePool.Get().(*ListNode)
 			newNode.Value = element
 			newNode.Prev = nil
@@ -272,6 +369,7 @@ func (l *List) Insert(pivot []byte, element []byte, before bool) int {
 				node.Next = newNode
 			}
 			l.Len++
+			l.TotalBytes += int64(len(element))
 			return l.Len
 		}
 		node = node.Next
@@ -356,6 +454,8 @@ func (l *List) Trim(start, end int) int {
 		l.Head = nil
 		l.Tail = nil
 		l.Len = 0
+		l.TotalBytes = 0
+		l.tryConvertShrinkingLocked()
 		return 0
 	}
 
@@ -364,6 +464,7 @@ func (l *List) Trim(start, end int) int {
 	node := l.Head
 	for node != nil && idx < start {
 		next := node.Next
+		l.TotalBytes -= int64(len(node.Value))
 		node.Value = nil
 		node.Prev = nil
 		node.Next = nil
@@ -393,6 +494,7 @@ func (l *List) Trim(start, end int) int {
 		l.Tail = keptTail
 		for node != nil {
 			next := node.Next
+			l.TotalBytes -= int64(len(node.Value))
 			node.Value = nil
 			node.Prev = nil
 			node.Next = nil
@@ -405,8 +507,10 @@ func (l *List) Trim(start, end int) int {
 		l.Head = nil
 		l.Tail = nil
 		l.Len = 0
+		l.TotalBytes = 0
 	}
 
+	l.tryConvertShrinkingLocked()
 	return l.Len
 }
 

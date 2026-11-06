@@ -23,6 +23,7 @@ func (c XRangeCommand) Execute(ctx *context.Context, args []types.Value) types.V
 	startStr := string(args[1].Str)
 	endStr := string(args[2].Str)
 	count := 0
+	hasCount := false
 
 	// Validate range IDs with context-awareness
 	if err := validateStartRangeID(startStr); err != nil {
@@ -40,6 +41,7 @@ func (c XRangeCommand) Execute(ctx *context.Context, args []types.Value) types.V
 				return types.NewError("ERR value is not an integer or out of range")
 			}
 			count = v
+			hasCount = true
 			break
 		}
 	}
@@ -50,6 +52,9 @@ func (c XRangeCommand) Execute(ctx *context.Context, args []types.Value) types.V
 	}
 	if obj.Type != object.TypeStream {
 		return types.NewError("WRONGTYPE Operation against a key holding the wrong kind of value")
+	}
+	if hasCount && count == 0 {
+		return types.RespEmptyArr
 	}
 
 	stream := obj.Value.(*object.Stream)

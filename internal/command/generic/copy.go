@@ -54,5 +54,6 @@ func (c CopyCommand) Execute(ctx *context.Context, args []types.Value) types.Val
 
 	// Deep copy the object
 	ctx.Engine.Set(dst, srcObj.DeepCopy())
+	ctx.SignalKey(dst)
 	return types.NewInt(1)
 }

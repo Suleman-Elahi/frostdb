@@ -42,35 +42,51 @@ func (c HSetExCommand) Execute(ctx *context.Context, args []types.Value) types.V
 		opt = strings.ToUpper(string(args[idx].Str))
 		if opt == "EX" {
 			idx++
-			if idx >= len(args) { return types.NewError("ERR syntax error") }
+			if idx >= len(args) {
+				return types.NewError("ERR syntax error")
+			}
 			val, err := strconv.ParseInt(string(args[idx].Str), 10, 64)
-			if err != nil { return types.NewError("ERR value is not an integer or out of range") }
+			if err != nil {
+				return types.NewError("ERR value is not an integer or out of range")
+			}
 			idx++
 			expireTime = nowMs + (val * 1000)
 			hasExpire = true
 			isRelative = true
 		} else if opt == "PX" {
 			idx++
-			if idx >= len(args) { return types.NewError("ERR syntax error") }
+			if idx >= len(args) {
+				return types.NewError("ERR syntax error")
+			}
 			val, err := strconv.ParseInt(string(args[idx].Str), 10, 64)
-			if err != nil { return types.NewError("ERR value is not an integer or out of range") }
+			if err != nil {
+				return types.NewError("ERR value is not an integer or out of range")
+			}
 			idx++
 			expireTime = nowMs + val
 			hasExpire = true
 			isRelative = true
 		} else if opt == "EXAT" {
 			idx++
-			if idx >= len(args) { return types.NewError("ERR syntax error") }
+			if idx >= len(args) {
+				return types.NewError("ERR syntax error")
+			}
 			val, err := strconv.ParseInt(string(args[idx].Str), 10, 64)
-			if err != nil { return types.NewError("ERR value is not an integer or out of range") }
+			if err != nil {
+				return types.NewError("ERR value is not an integer or out of range")
+			}
 			idx++
 			expireTime = val * 1000
 			hasExpire = true
 		} else if opt == "PXAT" {
 			idx++
-			if idx >= len(args) { return types.NewError("ERR syntax error") }
+			if idx >= len(args) {
+				return types.NewError("ERR syntax error")
+			}
 			val, err := strconv.ParseInt(string(args[idx].Str), 10, 64)
-			if err != nil { return types.NewError("ERR value is not an integer or out of range") }
+			if err != nil {
+				return types.NewError("ERR value is not an integer or out of range")
+			}
 			idx++
 			expireTime = val
 			hasExpire = true
@@ -107,7 +123,7 @@ func (c HSetExCommand) Execute(ctx *context.Context, args []types.Value) types.V
 
 	obj, ok := ctx.Engine.Get(key)
 	var h *object.Hash
-	
+
 	if ok {
 		if obj.Type != object.TypeHash {
 			return types.NewError("WRONGTYPE Operation against a key holding the wrong kind of value")
@@ -118,7 +134,6 @@ func (c HSetExCommand) Execute(ctx *context.Context, args []types.Value) types.V
 			if h.Len() == 0 {
 				ctx.Engine.Del(key)
 				ctx.Engine.NotifyKeyEvent(ctx.DB, uint32(keyevent.FlagGeneric), "del", key)
-				ctx.Engine.LogCommand([][]byte{[]byte("DEL"), []byte(key)})
 			}
 			return types.NewInt(0)
 		}
@@ -138,7 +153,6 @@ func (c HSetExCommand) Execute(ctx *context.Context, args []types.Value) types.V
 				if hashBecameEmptyAfterLazyExpire {
 					ctx.Engine.Del(key)
 					ctx.Engine.NotifyKeyEvent(ctx.DB, uint32(keyevent.FlagGeneric), "del", key)
-					ctx.Engine.LogCommand([][]byte{[]byte("DEL"), []byte(key)})
 				}
 				return types.NewInt(0) // If any exists, do not set anything
 			}
@@ -149,7 +163,6 @@ func (c HSetExCommand) Execute(ctx *context.Context, args []types.Value) types.V
 				if hashBecameEmptyAfterLazyExpire {
 					ctx.Engine.Del(key)
 					ctx.Engine.NotifyKeyEvent(ctx.DB, uint32(keyevent.FlagGeneric), "del", key)
-					ctx.Engine.LogCommand([][]byte{[]byte("DEL"), []byte(key)})
 				}
 				return types.NewInt(0) // If any does not exist, do not set anything
 			}
@@ -161,11 +174,11 @@ func (c HSetExCommand) Execute(ctx *context.Context, args []types.Value) types.V
 	ttlDeletedCount := 0
 	for i, f := range fields {
 		v := values[i]
-		
+
 		oldTTL := h.GetTTL(f)
-		
+
 		h.Set(f, v) // this clears the TTL inside object.Hash
-		
+
 		if keepTTL {
 			if oldTTL > 0 {
 				h.SetTTL(f, oldTTL)
@@ -198,17 +211,7 @@ func (c HSetExCommand) Execute(ctx *context.Context, args []types.Value) types.V
 	if h.Len() == 0 {
 		ctx.Engine.Del(key)
 		ctx.Engine.NotifyKeyEvent(ctx.DB, uint32(keyevent.FlagGeneric), "del", key)
-		ctx.Engine.LogCommand([][]byte{[]byte("DEL"), []byte(key)})
 	}
 
-	rawArgs := make([][]byte, 0, len(args)+1)
-	rawArgs = append(rawArgs, []byte("HSETEX"))
-	for _, a := range args {
-		rawArgs = append(rawArgs, a.Str)
-	}
-	ctx.Engine.LogCommand(rawArgs)
-	ctx.SkipReplication = true
-
-	// If FNX/FXX condition passes, all fields are set.
 	return types.NewInt(1)
 }

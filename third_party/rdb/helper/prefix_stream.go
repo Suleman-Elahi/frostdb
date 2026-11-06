@@ -93,6 +93,7 @@ func SepPrefixAnalyse(rdbFilename string, topN int, maxDepth int, separators []s
 	}
 
 	// sort by size descending
+	
 	type entry struct {
 		db       string
 		prefix   string

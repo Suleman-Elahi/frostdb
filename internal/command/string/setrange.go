@@ -1,8 +1,6 @@
 package str
 
 import (
-	"strings"
-
 	"frostdb/internal/engine/object"
 	"frostdb/internal/kernel/context"
 	"frostdb/internal/resp/types"
@@ -38,15 +36,15 @@ func (c SetRangeCommand) Execute(ctx *context.Context, args []types.Value) types
 	}
 	offset := int(offset64)
 
-	value := string(args[2].Str)
+	value := args[2].Str
 
-	var current string
+	var current []byte
 	obj, ok := ctx.Engine.Get(key)
 	if ok {
 		if obj.Type != object.TypeString {
 			return types.NewError("WRONGTYPE Operation against a key holding the wrong kind of value")
 		}
-		current, _ = obj.Value.(string)
+		current, _ = obj.Value.([]byte)
 	}
 
 	// If key doesn't exist and value is empty, return 0 without creating key.
@@ -60,19 +58,18 @@ func (c SetRangeCommand) Execute(ctx *context.Context, args []types.Value) types
 		return types.NewError("ERR string exceeds maximum allowed size (proto-max-bulk-len)")
 	}
 
-	// Extend with zero bytes if needed.
-	if needed > len(current) {
-		var b strings.Builder
-		b.Grow(needed)
-		b.WriteString(current)
-		for i := len(current); i < needed; i++ {
-			b.WriteByte(0)
-		}
-		current = b.String()
+	// Build the result in a fresh buffer sized to the larger of the existing
+	// length and the needed length (SETRANGE never shrinks the string): copy
+	// the existing bytes first (zero-padding is implicit from make()), then
+	// overwrite at offset. Never mutate `current` in place — it may still be
+	// referenced by the live Object until Set() below replaces it.
+	resultLen := needed
+	if len(current) > resultLen {
+		resultLen = len(current)
 	}
-
-	// Overwrite at offset.
-	result := current[:offset] + value + current[offset+len(value):]
+	result := make([]byte, resultLen)
+	copy(result, current)
+	copy(result[offset:], value)
 
 	var newObj *object.Object
 	if ok {

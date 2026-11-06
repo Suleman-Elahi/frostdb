@@ -40,11 +40,13 @@ func (c SetBitCommand) Execute(ctx *context.Context, args []types.Value) types.V
 	var data []byte
 	obj, exists := ctx.Engine.Get(key)
 	if exists {
-		strVal, ok := obj.Value.(string)
+		strVal, ok := obj.Value.([]byte)
 		if !ok {
 			return types.NewError("WRONGTYPE Operation against a key holding the wrong kind of value")
 		}
-		data = []byte(strVal)
+		// Copy: data may be extended/mutated below, and strVal is the
+		// live Object's storage until we call Set with the new Object.
+		data = append([]byte(nil), strVal...)
 	}
 
 	// Extend string if needed
@@ -67,7 +69,7 @@ func (c SetBitCommand) Execute(ctx *context.Context, args []types.Value) types.V
 
 	// Only write to engine if the value actually changed
 	if oldBit != byte(value) || !exists || byteIndex >= origLen {
-		newObj := object.AcquireRawStringObject(string(data))
+		newObj := object.AcquireRawStringObject(data)
 		if exists && obj.ExpireAt > 0 {
 			newObj.ExpireAt = obj.ExpireAt
 		}
@@ -98,7 +100,7 @@ func (c GetBitCommand) Execute(ctx *context.Context, args []types.Value) types.V
 		return types.RespZero
 	}
 
-	strVal, ok := obj.Value.(string)
+	strVal, ok := obj.Value.([]byte)
 	if !ok {
 		return types.NewError("WRONGTYPE Operation against a key holding the wrong kind of value")
 	}
@@ -154,12 +156,12 @@ func (c BitCountCommand) Execute(ctx *context.Context, args []types.Value) types
 		return types.RespZero
 	}
 
-	strVal, ok := obj.Value.(string)
+	strVal, ok := obj.Value.([]byte)
 	if !ok {
 		return types.NewError("WRONGTYPE Operation against a key holding the wrong kind of value")
 	}
 
-	data := []byte(strVal)
+	data := strVal
 	length := len(data)
 
 	if len(args) == 1 {
@@ -317,12 +319,12 @@ func (c BitPosCommand) Execute(ctx *context.Context, args []types.Value) types.V
 		return types.NewInt(-1)
 	}
 
-	strVal, ok := obj.Value.(string)
+	strVal, ok := obj.Value.([]byte)
 	if !ok {
 		return types.NewError("WRONGTYPE Operation against a key holding the wrong kind of value")
 	}
 
-	data := []byte(strVal)
+	data := strVal
 	length := len(data)
 
 	s := int(start)

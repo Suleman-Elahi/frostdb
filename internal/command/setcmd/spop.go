@@ -77,22 +77,19 @@ func (c SPopCommand) Execute(ctx *context.Context, args []types.Value) types.Val
 	if s.Len() == 0 {
 		ctx.Engine.Del(string(args[0].Str))
 		cfg := ctx.Engine.GetEvictionConfig()
-		var cmd []byte
+		cmd := []byte("DEL")
 		if cfg.LazyfreeLazyServerDel {
 			cmd = []byte("UNLINK")
-		} else {
-			cmd = []byte("DEL")
 		}
-		ctx.Engine.LogCommand([][]byte{cmd, args[0].Str})
+		ctx.ReplicateAs = [][]byte{cmd, args[0].Str}
 	} else {
 		replArgs := make([][]byte, 0, len(selected)+2)
 		replArgs = append(replArgs, []byte("SREM"), args[0].Str)
 		for _, m := range selected {
 			replArgs = append(replArgs, []byte(m))
 		}
-		ctx.Engine.LogCommand(replArgs)
+		ctx.ReplicateAs = replArgs
 	}
-	ctx.SkipReplication = true
 
 	if withCount {
 		res := make([]types.Value, count)

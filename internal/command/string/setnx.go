@@ -25,7 +25,7 @@ func (c SetNXCommand) Execute(ctx *context.Context, args []types.Value) types.Va
 	}
 
 	key := string(args[0].Str)
-	val := string(args[1].Str)
+	val := args[1].Str
 	ctx.Engine.Set(key, object.AcquireStringObject(val))
 	return types.RespOne
 }
@@ -46,10 +46,14 @@ func (c SetEXCommand) Execute(ctx *context.Context, args []types.Value) types.Va
 	}
 
 	key := string(args[0].Str)
-	val := string(args[2].Str)
+	val := args[2].Str
 	obj := object.AcquireStringObject(val)
 	obj.ExpireAt = ctx.NowMs() + secs*1000
 	ctx.Engine.Set(key, obj)
+	ctx.ReplicateAs = [][]byte{
+		[]byte("SET"), args[0].Str, args[2].Str,
+		[]byte("PXAT"), []byte(strconv.FormatInt(obj.ExpireAt, 10)),
+	}
 	return types.RespOK
 }
 
@@ -69,10 +73,14 @@ func (c PSetEXCommand) Execute(ctx *context.Context, args []types.Value) types.V
 	}
 
 	key := string(args[0].Str)
-	val := string(args[2].Str)
+	val := args[2].Str
 	obj := object.AcquireStringObject(val)
 	obj.ExpireAt = ctx.NowMs() + ms
 	ctx.Engine.Set(key, obj)
+	ctx.ReplicateAs = [][]byte{
+		[]byte("SET"), args[0].Str, args[2].Str,
+		[]byte("PXAT"), []byte(strconv.FormatInt(obj.ExpireAt, 10)),
+	}
 	return types.RespOK
 }
 

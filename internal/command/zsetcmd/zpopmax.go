@@ -47,8 +47,7 @@ func (c ZPopMaxCommand) Execute(ctx *context.Context, args []types.Value) types.
 
 	if zset.Len() == 0 {
 		ctx.Engine.Del(key)
-		ctx.Engine.LogCommand([][]byte{[]byte("DEL"), []byte(key)}) //nolint:errcheck
-		ctx.SkipReplication = true
+		ctx.ReplicateAs = [][]byte{[]byte("DEL"), []byte(key)}
 	}
 
 	if ctx.Protocol >= 3 {

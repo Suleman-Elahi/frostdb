@@ -12,11 +12,11 @@ import (
 	"frostdb/internal/resp/types"
 )
 
-// digestString returns a deterministic 64-bit hash of the given string using
-// XXH3_64bits. The output is always represented as a 16-character lowercase hex
-// string with leading zeros preserved (e.g. "00006c38adf31777").
-func digestString(s string) string {
-	h := xxh3.HashString(s)
+// digestStringBytes returns a deterministic 64-bit hash of the given bytes
+// using XXH3_64bits. The output is always represented as a 16-character
+// lowercase hex string with leading zeros preserved (e.g. "00006c38adf31777").
+func digestStringBytes(b []byte) string {
+	h := xxh3.Hash(b)
 	return fmt.Sprintf("%016x", h)
 }
 
@@ -41,8 +41,8 @@ func (c DigestCommand) Execute(ctx *context.Context, args []types.Value) types.V
 		return types.NewError("WRONGTYPE Operation against a key holding the wrong kind of value")
 	}
 
-	strVal, _ := obj.Value.(string)
-	return types.NewString(digestString(strVal))
+	strVal, _ := object.StringBytes(obj)
+	return types.NewString(digestStringBytes(strVal))
 }
 
 // parseDigestArg validates that a digest argument is exactly 16 lowercase/uppercase

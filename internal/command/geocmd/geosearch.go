@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 
+	"frostdb/internal/engine/keyevent"
 	"frostdb/internal/engine/object"
 	"frostdb/internal/kernel/context"
 	"frostdb/internal/resp/types"
@@ -296,11 +297,18 @@ func runGeoSearch(ctx *context.Context, zset *object.ZSet, exists bool, q *geoQu
 			}
 			newZSet.Add(score, p.member)
 		}
+		oldObj, existed := ctx.Engine.Get(q.storeKey)
 		ctx.Engine.Set(q.storeKey, &object.Object{
 			Type:     object.TypeZSet,
 			Encoding: object.EncodingRaw,
 			Value:    newZSet,
 		})
+		if existed && oldObj != nil {
+			ctx.Engine.NotifyKeyEvent(ctx.DB, uint32(keyevent.FlagOverwrite), "overwritten", q.storeKey)
+			if oldObj.Type != object.TypeZSet {
+				ctx.Engine.NotifyKeyEvent(ctx.DB, uint32(keyevent.FlagTypeChanged), "type_changed", q.storeKey)
+			}
+		}
 		signalKey(ctx, q.storeKey)
 		return types.NewInt(int64(len(points)))
 	}
@@ -351,11 +359,7 @@ func parseUnit(unit string) (conv float64, errVal types.Value, ok bool) {
 
 // signalKey notifies watchers of a key change, respecting MULTI/EXEC batching.
 func signalKey(ctx *context.Context, key string) {
-	if ctx.ExecutingMulti {
-		ctx.DeferredSignals = append(ctx.DeferredSignals, key)
-	} else {
-		ctx.Engine.SignalKey(key)
-	}
+	ctx.SignalKey(key)
 }
 
 // deleteAndSignal removes a key and signals the change.

@@ -109,13 +109,14 @@ func TestSepPrefixAnalyse(t *testing.T) {
 	}
 
 	// should contain expected prefixes
+
 	for _, expected := range []string{"user:*", "post:*", "stat:*", "stat:user:*", "stat:post:*"} {
 		if !prefixSet[expected] {
 			t.Errorf("expected prefix %q not found in output", expected)
 		}
 	}
 
-	// "solo" has no separator so should NOT appear as a prefix
+	
 	for prefix := range prefixSet {
 		if strings.HasPrefix(prefix, "solo") {
 			t.Errorf("unexpected prefix for key without separator: %s", prefix)
@@ -157,6 +158,7 @@ func TestSepPrefixAnalyseTopN(t *testing.T) {
 		t.Errorf("expected 2 data lines (topN=2), got %d", len(dataLines))
 	}
 }
+
 
 func TestSepPrefixAnalyseMaxDepth(t *testing.T) {
 	err := os.MkdirAll("tmp", os.ModePerm)

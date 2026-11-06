@@ -10,6 +10,8 @@ import (
 
 	"frostdb/internal/blocking"
 	"frostdb/internal/engine/api"
+	"frostdb/internal/engine/core"
+	"frostdb/internal/engine/persistence/wal"
 	"frostdb/internal/kernel/context"
 	"frostdb/internal/resp/types"
 	"frostdb/internal/scripting"
@@ -39,7 +41,7 @@ func (c InfoCommand) Name() string {
 func (c InfoCommand) Execute(ctx *context.Context, args []types.Value) types.Value {
 	// Parse sections - Redis 7.0+ supports multiple sections
 	sections := make(map[string]bool)
-	
+
 	if len(args) == 0 {
 		sections["default"] = true
 	} else {
@@ -107,7 +109,7 @@ func (c InfoCommand) Execute(ctx *context.Context, args []types.Value) types.Val
 		if !sections[section] {
 			continue
 		}
-		
+
 		content := buildSection(ctx, section)
 		if content != "" {
 			sb.WriteString(content)
@@ -179,7 +181,7 @@ func buildServerSection() string {
 	sb.WriteString("hz:10\r\n")
 	sb.WriteString("configured_hz:10\r\n")
 	sb.WriteString(fmt.Sprintf("lru_clock:%d\r\n", uint32(time.Now().Unix())&((1<<24)-1)))
-	
+
 	exe, _ := os.Executable()
 	if exe == "" {
 		exe = "./frostdb"
@@ -189,13 +191,13 @@ func buildServerSection() string {
 	sb.WriteString("io_threads_active:0\r\n")
 	sb.WriteString("listener0:name=tcp,bind=*,port=6379\r\n")
 	sb.WriteString("\r\n")
-	
+
 	return sb.String()
 }
 
 func buildClientsSection() string {
 	st := stats.Get()
-	
+
 	var sb strings.Builder
 	sb.WriteString("# Clients\r\n")
 	sb.WriteString(fmt.Sprintf("connected_clients:%d\r\n", st.ConnectedClients.Load()))
@@ -212,7 +214,7 @@ func buildClientsSection() string {
 	sb.WriteString("total_blocking_keys:0\r\n")
 	sb.WriteString("total_blocking_keys_on_nokey:0\r\n")
 	sb.WriteString("\r\n")
-	
+
 	return sb.String()
 }
 
@@ -271,7 +273,7 @@ func buildMemorySection(ctx *context.Context) string {
 	sb.WriteString("allocator_rss_bytes:0\r\n")
 	sb.WriteString("rss_overhead_ratio:1.00\r\n")
 	sb.WriteString("rss_overhead_bytes:0\r\n")
-	
+
 	fragRatio := float64(1.0)
 	if ms.Alloc > 0 {
 		fragRatio = float64(ms.Sys) / float64(ms.Alloc)
@@ -291,11 +293,50 @@ func buildMemorySection(ctx *context.Context) string {
 	sb.WriteString("lazyfree_pending_objects:0\r\n")
 	sb.WriteString("lazyfreed_objects:0\r\n")
 	sb.WriteString("\r\n")
-	
+
 	return sb.String()
 }
 
 func buildPersistenceSection(ctx *context.Context) string {
+	status := wal.Status{FsyncMode: wal.FsyncEverySec, Healthy: true}
+	checkpointStatus := core.CheckpointStatus{}
+	walFailurePolicy := "stop-writes"
+	writeAdmission := "accept"
+	var dirty int64
+	if ctx != nil && ctx.Engine != nil {
+		dirty = ctx.Engine.GetDirty()
+		if provider, ok := ctx.Engine.(interface{ PersistenceStatus() wal.Status }); ok {
+			status = provider.PersistenceStatus()
+		}
+		if provider, ok := ctx.Engine.(interface{ CheckpointStatus() core.CheckpointStatus }); ok {
+			checkpointStatus = provider.CheckpointStatus()
+		}
+		if admission, ok := ctx.Engine.(interface{ WALWriteAdmission() (bool, string) }); ok {
+			allowed, policy := admission.WALWriteAdmission()
+			walFailurePolicy = policy
+			if !allowed {
+				writeAdmission = "reject"
+			}
+		}
+	}
+
+	aofEnabled := 0
+	if status.Enabled {
+		aofEnabled = 1
+	}
+	writeStatus := "ok"
+	if !status.Healthy {
+		writeStatus = "err"
+	}
+	checkpointInProgress := 0
+	if checkpointStatus.InProgress {
+		checkpointInProgress = 1
+	}
+	checkpointResult := "ok"
+	if checkpointStatus.LastError != "" {
+		checkpointResult = "err"
+	}
+
 	var sb strings.Builder
 	sb.WriteString("# Persistence\r\n")
 	sb.WriteString("loading:0\r\n")
@@ -306,41 +347,57 @@ func buildPersistenceSection(ctx *context.Context) string {
 	sb.WriteString("current_fork_perc:0.00\r\n")
 	sb.WriteString("current_save_keys_processed:0\r\n")
 	sb.WriteString("current_save_keys_total:0\r\n")
-	sb.WriteString(fmt.Sprintf("rdb_changes_since_last_save:%d\r\n", ctx.Engine.GetDirty()))
-	sb.WriteString("rdb_bgsave_in_progress:0\r\n")
+	sb.WriteString(fmt.Sprintf("rdb_changes_since_last_save:%d\r\n", dirty))
+	sb.WriteString(fmt.Sprintf("rdb_bgsave_in_progress:%d\r\n", checkpointInProgress))
 	sb.WriteString(fmt.Sprintf("rdb_last_save_time:%d\r\n", ServerStartTime.Unix()))
-	sb.WriteString("rdb_last_bgsave_status:ok\r\n")
+	sb.WriteString(fmt.Sprintf("rdb_last_bgsave_status:%s\r\n", checkpointResult))
 	sb.WriteString("rdb_last_bgsave_time_sec:-1\r\n")
 	sb.WriteString("rdb_current_bgsave_time_sec:-1\r\n")
 	sb.WriteString("rdb_saves:0\r\n")
 	sb.WriteString("rdb_last_cow_size:0\r\n")
 	sb.WriteString("rdb_last_load_keys_expired:0\r\n")
 	sb.WriteString("rdb_last_load_keys_loaded:0\r\n")
-	sb.WriteString("aof_enabled:1\r\n")  // FrostDB uses WAL
-	sb.WriteString(fmt.Sprintf("aof_rewrite_in_progress:%d\r\n", ctx.Engine.AOFRewriteInProgress()))
+	sb.WriteString(fmt.Sprintf("aof_enabled:%d\r\n", aofEnabled))
+	if ctx != nil && ctx.Engine != nil {
+		sb.WriteString(fmt.Sprintf("aof_rewrite_in_progress:%d\r\n", ctx.Engine.AOFRewriteInProgress()))
+	} else {
+		sb.WriteString("aof_rewrite_in_progress:0\r\n")
+	}
 	sb.WriteString("aof_rewrite_scheduled:0\r\n")
 	sb.WriteString("aof_last_rewrite_time_sec:-1\r\n")
 	sb.WriteString("aof_current_rewrite_time_sec:-1\r\n")
 	sb.WriteString("aof_last_bgrewrite_status:ok\r\n")
-	sb.WriteString("aof_last_write_status:ok\r\n")
+	sb.WriteString(fmt.Sprintf("aof_last_write_status:%s\r\n", writeStatus))
 	sb.WriteString("aof_last_cow_size:0\r\n")
 	sb.WriteString("module_fork_in_progress:0\r\n")
 	sb.WriteString("module_fork_last_cow_size:0\r\n")
 	sb.WriteString("aof_rewrites:0\r\n")
-	sb.WriteString("aof_current_size:0\r\n")
+	sb.WriteString(fmt.Sprintf("aof_current_size:%d\r\n", status.CurrentSize))
 	sb.WriteString("aof_base_size:0\r\n")
 	sb.WriteString("aof_pending_rewrite:0\r\n")
 	sb.WriteString("aof_buffer_length:0\r\n")
 	sb.WriteString("aof_pending_bio_fsync:0\r\n")
-	sb.WriteString("aof_delayed_fsync:0\r\n")
+	sb.WriteString(fmt.Sprintf("aof_delayed_fsync:%d\r\n", status.FailureCount))
+	sb.WriteString(fmt.Sprintf("frostdb_wal_fsync_policy:%s\r\n", status.FsyncMode))
+	sb.WriteString(fmt.Sprintf("frostdb_wal_error_policy:%s\r\n", walFailurePolicy))
+	sb.WriteString(fmt.Sprintf("frostdb_wal_write_admission:%s\r\n", writeAdmission))
+	sb.WriteString(fmt.Sprintf("frostdb_wal_last_sync_unix_ms:%d\r\n", status.LastSyncUnixMilli))
+	sb.WriteString(fmt.Sprintf("frostdb_wal_failure_count:%d\r\n", status.FailureCount))
+	sb.WriteString(fmt.Sprintf("frostdb_wal_last_error:%s\r\n", status.LastError))
+	sb.WriteString(fmt.Sprintf("frostdb_checkpoint_in_progress:%d\r\n", checkpointInProgress))
+	sb.WriteString(fmt.Sprintf("frostdb_checkpoint_last_success_unix_ms:%d\r\n", checkpointStatus.LastSuccessUnixMilli))
+	sb.WriteString(fmt.Sprintf("frostdb_checkpoint_last_status:%s\r\n", checkpointResult))
+	sb.WriteString(fmt.Sprintf("frostdb_checkpoint_failure_count:%d\r\n", checkpointStatus.FailureCount))
+	sb.WriteString(fmt.Sprintf("frostdb_checkpoint_success_count:%d\r\n", checkpointStatus.SuccessCount))
+	sb.WriteString(fmt.Sprintf("frostdb_checkpoint_last_error:%s\r\n", checkpointStatus.LastError))
 	sb.WriteString("\r\n")
-	
+
 	return sb.String()
 }
 
 func buildStatsSection() string {
 	st := stats.Get()
-	
+
 	var sb strings.Builder
 	sb.WriteString("# Stats\r\n")
 	sb.WriteString(fmt.Sprintf("total_connections_received:%d\r\n", st.TotalConnectionsReceived.Load()))
@@ -406,7 +463,7 @@ func buildStatsSection() string {
 	sb.WriteString("acl_access_denied_key:0\r\n")
 	sb.WriteString("acl_access_denied_channel:0\r\n")
 	sb.WriteString("\r\n")
-	
+
 	return sb.String()
 }
 
@@ -425,7 +482,7 @@ func buildReplicationSection() string {
 	sb.WriteString("repl_backlog_first_byte_offset:0\r\n")
 	sb.WriteString("repl_backlog_histlen:0\r\n")
 	sb.WriteString("\r\n")
-	
+
 	return sb.String()
 }
 
@@ -440,24 +497,24 @@ func buildCPUSection() string {
 	sb.WriteString("used_cpu_sys_main_thread:0.000000\r\n")
 	sb.WriteString("used_cpu_user_main_thread:0.000000\r\n")
 	sb.WriteString("\r\n")
-	
+
 	return sb.String()
 }
 
 func buildCommandStatsSection() string {
 	st := stats.Get()
 	cmdStats := st.GetCommandStats()
-	
+
 	var sb strings.Builder
 	sb.WriteString("# Commandstats\r\n")
-	
+
 	// Sort command names for consistent output
 	names := make([]string, 0, len(cmdStats))
 	for name := range cmdStats {
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	
+
 	for _, name := range names {
 		stat := cmdStats[name]
 		sb.WriteString(fmt.Sprintf("cmdstat_%s:calls=%d,usec=%d,usec_per_call=%.2f,rejected_calls=%d,failed_calls=%d\r\n",
@@ -470,7 +527,7 @@ func buildCommandStatsSection() string {
 		))
 	}
 	sb.WriteString("\r\n")
-	
+
 	return sb.String()
 }
 
@@ -512,12 +569,12 @@ func buildModulesSection() string {
 func buildKeyspaceSection(ctx *context.Context) string {
 	var sb strings.Builder
 	sb.WriteString("# Keyspace\r\n")
-	
+
 	if ctx == nil || ctx.Engine == nil {
 		sb.WriteString("\r\n")
 		return sb.String()
 	}
-	
+
 	// Try to get MultiDB interface for keyspace stats
 	if mdb, ok := ctx.Engine.(api.MultiDB); ok {
 		for db := 0; db < mdb.NumDBs(); db++ {
@@ -534,7 +591,7 @@ func buildKeyspaceSection(ctx *context.Context) string {
 			sb.WriteString(fmt.Sprintf("db0:keys=%d,expires=0,avg_ttl=0\r\n", len(keys)))
 		}
 	}
-	
+
 	sb.WriteString("\r\n")
 	return sb.String()
 }

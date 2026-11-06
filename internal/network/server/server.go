@@ -127,10 +127,35 @@ func (s *Server) handleConnection(conn net.Conn) {
 		Conn:       conn,
 		Done:       cctx.Done(),
 		ClientID:   clientID,
-		CmdMu:      &registry.CmdMu,
+	}
+	ctx.RecordStatsNow = func(failed bool) {
+		if !ctx.StatsRecorded {
+			ctx.StatsRecorded = true
+			if ctx.LastCmd != "" {
+				elapsed := time.Since(ctx.CmdStartTime).Microseconds()
+				st.RecordCommand(strings.ToUpper(ctx.LastCmd), uint64(elapsed), failed)
+			}
+		}
 	}
 
 	generic.RegisterClient(ctx)
+
+	var cleanupSubsOnce sync.Once
+	cleanupSubs := func() {
+		cleanupSubsOnce.Do(func() {
+			if ctx != nil {
+				for _, cleanup := range ctx.Subscriptions {
+					cleanup()
+				}
+				for _, cleanup := range ctx.PatternSubs {
+					cleanup()
+				}
+				for _, cleanup := range ctx.ShardSubs {
+					cleanup()
+				}
+			}
+		})
+	}
 
 	defer func() {
 		s.mu.Lock()
@@ -138,14 +163,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 		s.mu.Unlock()
 
 		// Clean up any active PubSub subscriptions
-		if ctx != nil {
-			for _, cleanup := range ctx.Subscriptions {
-				cleanup()
-			}
-			for _, cleanup := range ctx.PatternSubs {
-				cleanup()
-			}
-		}
+		cleanupSubs()
 
 		generic.UnregisterClient(ctx)
 		_ = conn.Close()
@@ -153,15 +171,92 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 	p := parser.New(conn)
 	w := bufio.NewWriterSize(conn, writeBufferSize)
+	ctx.FlushWriter = func() {
+		if w.Buffered() > 0 {
+			_ = w.Flush()
+		}
+	}
 
-	cmdCh := make(chan []types.Value, 64) // buffered to decouple reader from executor
+	// Synchronous fast-path loop for normal commands (avoids goroutine/channel overhead)
+	for {
+		if ctx.PubSubCh != nil {
+			// Transition to PubSub mode loop!
+			break
+		}
+
+		val, err := p.Parse()
+		if err != nil {
+			if err != io.EOF && !isConnectionClosed(err) {
+				logger.Warn("parse error",
+					"remote", conn.RemoteAddr().String(),
+					"error", err,
+				)
+			}
+			return
+		}
+
+		var cmdArgs []types.Value
+		if val.Type == types.TypeArray {
+			cmdArgs = val.Array
+		}
+
+		if len(cmdArgs) > 0 {
+			cmdName := strings.ToUpper(string(cmdArgs[0].Str))
+			ctx.LastCmd = strings.ToLower(cmdName)
+			generic.UpdateClientLastCmd(ctx, ctx.LastCmd)
+
+			var result types.Value
+			startTime := time.Now()
+			ctx.CmdStartTime = startTime
+			ctx.StatsRecorded = false
+
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						logger.Error("panic in command handler",
+							"command", cmdName,
+							"panic", r,
+						)
+						result = types.NewError("ERR Internal server error")
+					}
+				}()
+				result = registry.Dispatch(ctx, cmdArgs)
+			}()
+
+			processCommandPostExecution(ctx, cmdArgs, cmdName, result, startTime, st)
+
+			if result.Type != types.TypeNoReply {
+				if err := encoder.Encode(w, result); err != nil {
+					return
+				}
+				if p.Buffered() == 0 {
+					if err := w.Flush(); err != nil {
+						return
+					}
+				}
+			}
+		} else if cmdArgs != nil {
+			result := types.NewError("ERR wrong number of arguments")
+			if err := encoder.Encode(w, result); err != nil {
+				return
+			}
+			if p.Buffered() == 0 {
+				if err := w.Flush(); err != nil {
+					return
+				}
+			}
+		}
+	}
+
+	// PubSub / Asynchronous path
+	cmdCh := make(chan []types.Value, 64)
 	errCh := make(chan error, 1)
 
-	// Read loop — must exit when the connection context is cancelled.
 	go func() {
 		for {
 			val, err := p.Parse()
 			if err != nil {
+				cleanupSubs()
 				cancel()
 				errCh <- err
 				return
@@ -170,8 +265,6 @@ func (s *Server) handleConnection(conn net.Conn) {
 			if val.Type == types.TypeArray {
 				cmd = val.Array
 			}
-			// Use a select so the goroutine exits if the connection handler
-			// has already returned and cancelled the context.
 			select {
 			case cmdCh <- cmd:
 			case <-cctx.Done():
@@ -180,7 +273,6 @@ func (s *Server) handleConnection(conn net.Conn) {
 		}
 	}()
 
-	// Execution loop
 	for {
 		select {
 		case err := <-errCh:
@@ -193,22 +285,16 @@ func (s *Server) handleConnection(conn net.Conn) {
 			return
 
 		case cmdArgs := <-cmdCh:
-			var result types.Value
-			var cmdName string
-			startTime := time.Now()
-
 			if len(cmdArgs) > 0 {
-				cmdName = strings.ToUpper(string(cmdArgs[0].Str))
-
+				cmdName := strings.ToUpper(string(cmdArgs[0].Str))
 				ctx.LastCmd = strings.ToLower(cmdName)
 				generic.UpdateClientLastCmd(ctx, ctx.LastCmd)
 
-				// Acquire the global command lock. This serializes all
-				// in-memory mutations across connections, matching
-				// Redis's single-threaded execution model.
-				registry.CmdMu.Lock()
+				var result types.Value
+				startTime := time.Now()
+				ctx.CmdStartTime = startTime
+				ctx.StatsRecorded = false
 
-				// Recover from panics in command handlers to keep the connection alive.
 				func() {
 					defer func() {
 						if r := recover(); r != nil {
@@ -222,135 +308,35 @@ func (s *Server) handleConnection(conn net.Conn) {
 					result = registry.Dispatch(ctx, cmdArgs)
 				}()
 
-				if ctx.Engine != nil && result.Type != types.TypeError && len(cmdArgs) > 1 {
-					// Only publish if the command mutated state.
-					// Most commands return an integer > 0 if they mutated state.
-					mutated := true
-					if result.Type == types.TypeInteger && result.Num == 0 {
-						// 0 means no mutation ONLY for specific commands.
-						if cmdName == "SADD" || cmdName == "SREM" || cmdName == "ZADD" || cmdName == "ZREM" || cmdName == "EXPIRE" {
-							mutated = false
-						}
-					} else if result.IsNull || result.Type == types.TypeNull || result.Type == types.TypeError {
-						mutated = false
-					} else if result.Type == types.TypeSimpleString && string(result.Str) == "QUEUED" {
-						mutated = false
-					}
+				processCommandPostExecution(ctx, cmdArgs, cmdName, result, startTime, st)
 
-					if mutated {
-						key := string(cmdArgs[1].Str)
-						db := ctx.DB
-						logger.Debug("notifyKeyEvent", "cmd", cmdName, "key", key, "db", db, "resultType", result.Type)
-						switch cmdName {
-						case "LPUSH":
-							ctx.Engine.NotifyKeyEvent(db, uint32(keyevent.FlagList), "lpush", key)
-						case "RPUSH":
-							ctx.Engine.NotifyKeyEvent(db, uint32(keyevent.FlagList), "rpush", key)
-						case "RPOP":
-							ctx.Engine.NotifyKeyEvent(db, uint32(keyevent.FlagList), "rpop", key)
-						case "EXPIRE":
-							ctx.Engine.NotifyKeyEvent(db, uint32(keyevent.FlagGeneric), "expire", key)
-						case "HSET":
-							ctx.Engine.NotifyKeyEvent(db, uint32(keyevent.FlagHash), "hset", key)
-						case "HMSET":
-							ctx.Engine.NotifyKeyEvent(db, uint32(keyevent.FlagHash), "hset", key)
-						case "HINCRBY":
-							ctx.Engine.NotifyKeyEvent(db, uint32(keyevent.FlagHash), "hincrby", key)
-						case "SADD":
-							ctx.Engine.NotifyKeyEvent(db, uint32(keyevent.FlagSet), "sadd", key)
-						case "SREM":
-							ctx.Engine.NotifyKeyEvent(db, uint32(keyevent.FlagSet), "srem", key)
-						case "ZADD":
-							ctx.Engine.NotifyKeyEvent(db, uint32(keyevent.FlagZSet), "zadd", key)
-						case "ZREM":
-							ctx.Engine.NotifyKeyEvent(db, uint32(keyevent.FlagZSet), "zrem", key)
-						case "XADD":
-							ctx.Engine.NotifyKeyEvent(db, uint32(keyevent.FlagStream), "xadd", key)
-						case "XGROUP":
-							if len(cmdArgs) > 2 {
-								subCmd := strings.ToLower(string(cmdArgs[1].Str))
-								xkey := string(cmdArgs[2].Str)
-								switch subCmd {
-								case "create":
-									ctx.Engine.NotifyKeyEvent(db, uint32(keyevent.FlagStream), "xgroup-create", xkey)
-								case "createconsumer":
-									ctx.Engine.NotifyKeyEvent(db, uint32(keyevent.FlagStream), "xgroup-createconsumer", xkey)
-								case "delconsumer":
-									ctx.Engine.NotifyKeyEvent(db, uint32(keyevent.FlagStream), "xgroup-delconsumer", xkey)
-								}
-							}
-						case "XREADGROUP":
-							if len(cmdArgs) > 4 {
-								for i, arg := range cmdArgs {
-									if strings.ToUpper(string(arg.Str)) == "STREAMS" && i+1 < len(cmdArgs) {
-										xkey := string(cmdArgs[i+1].Str)
-										ctx.Engine.NotifyKeyEvent(db, uint32(keyevent.FlagStream), "xgroup-createconsumer", xkey)
-										break
-									}
-								}
-							}
-						case "XCLAIM", "XAUTOCLAIM":
-							if len(cmdArgs) > 3 {
-								xkey := string(cmdArgs[1].Str)
-								ctx.Engine.NotifyKeyEvent(db, uint32(keyevent.FlagStream), "xgroup-createconsumer", xkey)
-							}
-						}
+				if result.Type != types.TypeNoReply {
+					if err := encoder.Encode(w, result); err != nil {
+						return
+					}
+					if err := w.Flush(); err != nil {
+						return
 					}
 				}
-
-				// Release the command lock before I/O (encode/flush).
-				registry.CmdMu.Unlock()
-
 			} else if cmdArgs != nil {
-				result = types.NewError("ERR wrong number of arguments")
-			} else {
-				result = types.NewError("ERR unknown request format")
-			}
-
-			// Record command stats
-			elapsed := time.Since(startTime).Microseconds()
-			failed := result.Type == types.TypeError
-			if cmdName != "" {
-				st.RecordCommand(cmdName, uint64(elapsed), failed)
-			}
-			if failed {
-				st.TotalErrorReplies.Add(1)
-				// Track per-error-type stats (first word of error message)
-				errMsg := string(result.Str)
-				errPrefix := errMsg
-				if spaceIdx := strings.IndexByte(errMsg, ' '); spaceIdx > 0 {
-					errPrefix = errMsg[:spaceIdx]
-				}
-				if errPrefix != "" {
-					st.RecordErrorType(errPrefix)
-				}
-			}
-
-			if result.Type != types.TypeNoReply {
+				result := types.NewError("ERR wrong number of arguments")
 				if err := encoder.Encode(w, result); err != nil {
-					if !isConnectionClosed(err) {
-						logger.Warn("encode error",
-							"remote", conn.RemoteAddr().String(),
-							"error", err,
-						)
-					}
 					return
 				}
 				if err := w.Flush(); err != nil {
-					if !isConnectionClosed(err) {
-						logger.Warn("flush error",
-							"remote", conn.RemoteAddr().String(),
-							"error", err,
-						)
-					}
 					return
 				}
 			}
 
 		case msg := <-ctx.PubSubCh:
-			// Handle PubSub messages asynchronously
 			var reply types.Value
-			if msg.Pattern != "" {
+			if msg.Pattern == "__shard" {
+				reply = types.NewArray([]types.Value{
+					types.NewString("smessage"),
+					types.NewString(msg.Channel),
+					types.NewString(msg.Message),
+				})
+			} else if msg.Pattern != "" {
 				reply = types.NewArray([]types.Value{
 					types.NewString("pmessage"),
 					types.NewString(msg.Pattern),
@@ -416,4 +402,74 @@ func isConnectionClosed(err error) bool {
 		return true
 	}
 	return false
+}
+
+func processCommandPostExecution(ctx *kctx.Context, cmdArgs []types.Value, cmdName string, result types.Value, startTime time.Time, st *stats.Stats) {
+	if ctx.Engine != nil && result.Type != types.TypeError && len(cmdArgs) > 1 {
+		// Only publish if the command mutated state.
+		// Most commands return an integer > 0 if they mutated state.
+		mutated := true
+		if result.Type == types.TypeInteger && result.Num == 0 {
+			// 0 means no mutation ONLY for specific commands.
+			if cmdName == "SADD" || cmdName == "SREM" || cmdName == "ZADD" || cmdName == "ZREM" || cmdName == "EXPIRE" {
+				mutated = false
+			}
+		} else if result.IsNull || result.Type == types.TypeNull || result.Type == types.TypeError {
+			mutated = false
+		} else if result.Type == types.TypeSimpleString && string(result.Str) == "QUEUED" {
+			mutated = false
+		}
+
+		if mutated {
+			key := string(cmdArgs[1].Str)
+			db := ctx.DB
+			logger.Debug("notifyKeyEvent", "cmd", cmdName, "key", key, "db", db, "resultType", result.Type)
+			switch cmdName {
+			case "LPUSH":
+				ctx.Engine.NotifyKeyEvent(db, uint32(keyevent.FlagList), "lpush", key)
+			case "RPUSH":
+				ctx.Engine.NotifyKeyEvent(db, uint32(keyevent.FlagList), "rpush", key)
+			case "RPOP":
+				ctx.Engine.NotifyKeyEvent(db, uint32(keyevent.FlagList), "rpop", key)
+			case "EXPIRE":
+				ctx.Engine.NotifyKeyEvent(db, uint32(keyevent.FlagGeneric), "expire", key)
+			case "HSET":
+				ctx.Engine.NotifyKeyEvent(db, uint32(keyevent.FlagHash), "hset", key)
+			case "HMSET":
+				ctx.Engine.NotifyKeyEvent(db, uint32(keyevent.FlagHash), "hset", key)
+			case "HINCRBY":
+				ctx.Engine.NotifyKeyEvent(db, uint32(keyevent.FlagHash), "hincrby", key)
+			case "SADD":
+				ctx.Engine.NotifyKeyEvent(db, uint32(keyevent.FlagSet), "sadd", key)
+			case "SREM":
+				ctx.Engine.NotifyKeyEvent(db, uint32(keyevent.FlagSet), "srem", key)
+			case "ZADD":
+				ctx.Engine.NotifyKeyEvent(db, uint32(keyevent.FlagZSet), "zadd", key)
+			case "ZREM":
+				ctx.Engine.NotifyKeyEvent(db, uint32(keyevent.FlagZSet), "zrem", key)
+			case "XADD":
+				ctx.Engine.NotifyKeyEvent(db, uint32(keyevent.FlagStream), "xadd", key)
+			}
+		}
+	}
+
+	// Record command stats
+	elapsed := time.Since(startTime).Microseconds()
+	failed := result.Type == types.TypeError
+	if cmdName != "" && !ctx.StatsRecorded {
+		st.RecordCommand(cmdName, uint64(elapsed), failed)
+	}
+	ctx.StatsRecorded = false
+	if failed {
+		st.TotalErrorReplies.Add(1)
+		// Track per-error-type stats (first word of error message)
+		errMsg := string(result.Str)
+		errPrefix := errMsg
+		if spaceIdx := strings.IndexByte(errMsg, ' '); spaceIdx > 0 {
+			errPrefix = errMsg[:spaceIdx]
+		}
+		if errPrefix != "" {
+			st.RecordErrorType(errPrefix)
+		}
+	}
 }

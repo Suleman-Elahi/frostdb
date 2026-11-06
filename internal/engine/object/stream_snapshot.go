@@ -4,6 +4,7 @@ import "container/list"
 
 type StreamSnapshot struct {
 	Entries              []StreamEntry
+	Blocks               [][]StreamEntry
 	Groups               []StreamGroupSnapshot
 	LastMS               uint64
 	LastSeq              uint64
@@ -21,6 +22,7 @@ type StreamGroupSnapshot struct {
 	Name            string
 	LastDeliveredID StreamID
 	Pending         []StreamPendingEntry
+	Consumers       map[string]int
 }
 
 type IDMPRecord struct {
@@ -49,17 +51,31 @@ func (s *Stream) Snapshot() StreamSnapshot {
 
 	s.Blocks.Ascend(func(b StreamBlock) bool {
 		it := b.Node.Iterator()
+		var blockEntries []StreamEntry
 		for it.HasNext() {
-			snap.Entries = append(snap.Entries, it.Next())
+			e := it.Next()
+			fieldsCopy := make([]StreamField, len(e.Fields))
+			copy(fieldsCopy, e.Fields)
+			entryCopy := StreamEntry{ID: e.ID, Fields: fieldsCopy}
+			snap.Entries = append(snap.Entries, entryCopy)
+			blockEntries = append(blockEntries, entryCopy)
+		}
+		if len(blockEntries) > 0 {
+			snap.Blocks = append(snap.Blocks, blockEntries)
 		}
 		return true
 	})
 
 	for _, g := range s.Groups {
+		consumers := make(map[string]int, len(g.Consumers))
+		for k, v := range g.Consumers {
+			consumers[k] = v
+		}
 		gs := StreamGroupSnapshot{
 			Name:            g.Name,
 			LastDeliveredID: g.LastDeliveredID,
 			Pending:         make([]StreamPendingEntry, 0, len(g.Pending)),
+			Consumers:       consumers,
 		}
 		for _, pe := range g.Pending {
 			gs.Pending = append(gs.Pending, *pe)
@@ -89,37 +105,65 @@ func (s *Stream) Snapshot() StreamSnapshot {
 
 func StreamFromSnapshot(snap StreamSnapshot) *Stream {
 	s := NewStream()
-	s.idmpDurationSec = snap.IDMPDuration
-	s.idmpMaxSize = snap.IDMPMaxSize
+	if snap.IDMPDuration > 0 {
+		s.idmpDurationSec = snap.IDMPDuration
+	}
+	if snap.IDMPMaxSize > 0 {
+		s.idmpMaxSize = snap.IDMPMaxSize
+	}
 	s.idmpAdded = snap.IDMPAdded
 	s.idmpDuplicates = snap.IDMPDuplicates
+
+	if len(snap.Blocks) > 0 {
+		for _, blockEntries := range snap.Blocks {
+			if len(blockEntries) == 0 {
+				continue
+			}
+			node := NewStreamNode()
+			for _, e := range blockEntries {
+				fieldsCopy := make([]StreamField, len(e.Fields))
+				copy(fieldsCopy, e.Fields)
+				node.AppendRaw(StreamEntry{ID: e.ID, Fields: fieldsCopy})
+			}
+			s.Blocks.ReplaceOrInsert(StreamBlock{
+				FirstID: blockEntries[0].ID,
+				Node:    node,
+			})
+			s.length += len(blockEntries)
+		}
+	} else {
+		for _, e := range snap.Entries {
+			_, _ = s.Add(e.ID.String(), e.Fields)
+		}
+	}
+
+	// Restore metadata AFTER populating blocks/entries so Add() cannot overwrite them.
 	s.lastMS = snap.LastMS
 	s.lastSeq = snap.LastSeq
 	s.entriesAdded = snap.EntriesAdded
 	s.recordedFirstEntryID = snap.RecordedFirstEntryID
 	s.maxDeletedEntryID = snap.MaxDeletedEntryID
 
-	for _, e := range snap.Entries {
-		_, _ = s.Add(e.ID.String(), e.Fields)
-	}
-	// Restore entriesAdded from snapshot (Add increments it, but we want the snapshot value)
-	s.entriesAdded = snap.EntriesAdded
-	// Restore recordedFirstEntryID (Add may have set it, but we want snapshot value)
-	s.recordedFirstEntryID = snap.RecordedFirstEntryID
-
 	for _, g := range snap.Groups {
-		_ = s.CreateGroup(g.Name, g.LastDeliveredID.String())
-		group := s.Groups[g.Name]
-		if group == nil {
-			continue
+		group := &StreamGroup{
+			Name:            g.Name,
+			LastDeliveredID: g.LastDeliveredID,
+			Pending:         make(map[StreamID]*StreamPendingEntry, len(g.Pending)),
+			Consumers:       make(map[string]int, len(g.Consumers)),
+		}
+		for k, v := range g.Consumers {
+			group.Consumers[k] = v
 		}
 		for _, pe := range g.Pending {
 			entry := pe
 			group.Pending[entry.Entry.ID] = &entry
 			if entry.Consumer != "" {
-				group.Consumers[entry.Consumer]++
+				if _, ok := group.Consumers[entry.Consumer]; !ok {
+					group.Consumers[entry.Consumer]++
+				}
 			}
 		}
+		s.Groups[g.Name] = group
 	}
 	if s.idmpByProducer == nil {
 		s.idmpByProducer = make(map[string]*idmpProducerState)
@@ -141,4 +185,3 @@ func StreamFromSnapshot(snap StreamSnapshot) *Stream {
 	}
 	return s
 }
-

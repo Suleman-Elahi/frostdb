@@ -44,10 +44,6 @@ func (c PushXCommand) Execute(ctx *context.Context, args []types.Value) types.Va
 		}
 	}
 
-	if ctx.ExecutingMulti {
-		ctx.DeferredSignals = append(ctx.DeferredSignals, key)
-	} else {
-		ctx.Engine.SignalKey(key)
-	}
+	ctx.SignalKey(key)
 	return types.NewInt(int64(list.LLen()))
 }

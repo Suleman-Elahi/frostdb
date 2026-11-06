@@ -1,6 +1,22 @@
 package api
 
-import "frostdb/internal/engine/object"
+import (
+	"frostdb/internal/engine/object"
+	"frostdb/internal/engine/shard"
+)
+
+// BlockingEngine is implemented by engines that support synchronous FIFO
+// signal handoff for blocking commands.
+type BlockingEngine interface {
+	SubscribeWaiter(keys []string) (*shard.Waiter, func())
+	FlushSignals(keys []string)
+}
+
+// PubSubOOMEngine is implemented by engines that track pubsub memory and shard channels.
+type PubSubOOMEngine interface {
+	CheckPubSubOOM(argBytes int64) bool
+	PubSubChannels(pattern string, shard bool) []string
+}
 
 // PubSubMessage represents a message published to a channel
 type PubSubMessage struct {
@@ -90,6 +106,8 @@ type Engine interface {
 
 	// Dirty counter for changes since last save
 	GetDirty() int64
+	AddDirty(n int64)
+	ResetDirty()
 }
 
 // MultiDB extends Engine with multi-database support.

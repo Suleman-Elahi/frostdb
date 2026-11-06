@@ -15,24 +15,13 @@ func (c PersistCommand) Execute(ctx *context.Context, args []types.Value) types.
 	}
 
 	key := string(args[0].Str)
-	
 	obj, ok := ctx.Engine.Get(key)
-	if !ok {
-		return types.NewInt(0)
-	}
-
-	if obj.ExpireAt == 0 {
+	if !ok || obj.ExpireAt == 0 {
+		ctx.SkipReplication = true
 		return types.NewInt(0)
 	}
 
 	obj.ExpireAt = 0
-	
-	// WAL logging
-	ctx.Engine.LogCommand([][]byte{
-		[]byte("PERSIST"),
-		args[0].Str,
-	}) //nolint:errcheck // error logged internally
-	ctx.SkipReplication = true
-
+	ctx.ReplicateAs = [][]byte{[]byte("PERSIST"), args[0].Str}
 	return types.NewInt(1)
 }

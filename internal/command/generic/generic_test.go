@@ -43,8 +43,8 @@ func TestDelCommand(t *testing.T) {
 	ctx := &context.Context{Engine: engine}
 
 	// Setup data
-	engine.Set("k1", &object.Object{Value: "v1"})
-	engine.Set("k2", &object.Object{Value: "v2"})
+	engine.Set("k1", &object.Object{Value: []byte("v1")})
+	engine.Set("k2", &object.Object{Value: []byte("v2")})
 
 	res := cmd.Execute(ctx, []types.Value{types.NewString("k1"), types.NewString("k2"), types.NewString("k3")})
 	if res.Type != types.TypeInteger || res.Num != 2 {
@@ -57,7 +57,7 @@ func TestExpireCommand(t *testing.T) {
 	engine := core.New()
 	ctx := &context.Context{Engine: engine}
 
-	engine.Set("k1", &object.Object{Value: "v1"})
+	engine.Set("k1", &object.Object{Value: []byte("v1")})
 
 	res := cmd.Execute(ctx, []types.Value{types.NewString("k1"), types.NewString("10")})
 	if res.Type != types.TypeInteger || res.Num != 1 {

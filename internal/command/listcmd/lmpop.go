@@ -52,7 +52,7 @@ func (c LMPOPCommand) Execute(ctx *context.Context, args []types.Value) types.Va
 		}
 		n, err := strconv.Atoi(string(args[minArgs+1].Str))
 		if err != nil || n <= 0 {
-			return types.NewError("ERR COUNT should be greater than 0")
+			return types.NewError("ERR count should be greater than 0")
 		}
 		count = n
 	}
@@ -89,12 +89,18 @@ func (c LMPOPCommand) Execute(ctx *context.Context, args []types.Value) types.Va
 		if list.LLen() == 0 {
 			ctx.Engine.Del(key)
 		}
+		popCmd := "LPOP"
+		if !popLeft {
+			popCmd = "RPOP"
+		}
+		ctx.ReplicateAs = [][]byte{[]byte(popCmd), []byte(key), []byte(strconv.Itoa(len(items)))}
 		return types.NewArray([]types.Value{
 			types.NewString(key),
 			types.NewArray(items),
 		})
 	}
 
+	ctx.SkipReplication = true
 	if ctx.Protocol >= 3 {
 		return types.NewNull()
 	}

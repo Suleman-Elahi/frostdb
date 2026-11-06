@@ -52,6 +52,7 @@ func (c ZIncrByCommand) Execute(ctx *context.Context, args []types.Value) types.
 	}
 
 	zset.Add(newScore, member)
+	ctx.SignalKey(key)
 
 	return types.NewString(formatScore(newScore))
 }

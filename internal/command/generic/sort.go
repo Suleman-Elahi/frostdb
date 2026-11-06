@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 
+	"frostdb/internal/engine/keyevent"
 	"frostdb/internal/engine/object"
 	"frostdb/internal/kernel/context"
 	"frostdb/internal/resp/types"
@@ -114,11 +115,15 @@ func execSort(ctx *context.Context, args []types.Value, readOnly bool) types.Val
 				if hashOk && hashObj.Type == object.TypeHash {
 					h := hashObj.Value.(*object.Hash)
 					if val, found := h.Get(p.byField); found {
-						w, err := strconv.ParseFloat(val, 64)
-						if err != nil {
-							return types.NewError("ERR One or more scores can't be converted into double")
+						if p.alpha {
+							se.alpha = val
+						} else {
+							w, err := strconv.ParseFloat(val, 64)
+							if err != nil {
+								return types.NewError("ERR One or more scores can't be converted into double")
+							}
+							se.weight = w
 						}
-						se.weight = w
 						entries = append(entries, se)
 						continue
 					}
@@ -127,12 +132,16 @@ func execSort(ctx *context.Context, args []types.Value, readOnly bool) types.Val
 			} else {
 				wObj, wOk := ctx.Engine.Get(k)
 				if wOk && wObj.Type == object.TypeString {
-					val := wObj.Value.(string)
-					w, err := strconv.ParseFloat(val, 64)
-					if err != nil {
-						return types.NewError("ERR One or more scores can't be converted into double")
+					val, _ := wObj.Value.([]byte)
+					if p.alpha {
+						se.alpha = string(val)
+					} else {
+						w, err := strconv.ParseFloat(string(val), 64)
+						if err != nil {
+							return types.NewError("ERR One or more scores can't be converted into double")
+						}
+						se.weight = w
 					}
-					se.weight = w
 				} else {
 					se.weight = 0
 				}
@@ -152,7 +161,14 @@ func execSort(ctx *context.Context, args []types.Value, readOnly bool) types.Val
 	} else {
 		sort.SliceStable(entries, func(i, j int) bool {
 			ai, aj := entries[i], entries[j]
-			if ai.weight != aj.weight {
+			if p.alpha {
+				if ai.alpha != aj.alpha {
+					if p.desc {
+						return ai.alpha > aj.alpha
+					}
+					return ai.alpha < aj.alpha
+				}
+			} else if ai.weight != aj.weight {
 				if p.desc {
 					return ai.weight > aj.weight
 				}
@@ -236,7 +252,11 @@ func buildSortResult(ctx *context.Context, entries []sortEntry, p *sortParams) t
 					} else {
 						vObj, vOk := ctx.Engine.Get(k)
 						if vOk && vObj.Type == object.TypeString {
-							result = append(result, types.NewString(vObj.Value.(string)))
+							if b, ok := vObj.Value.([]byte); ok {
+								result = append(result, types.NewBytes(b))
+							} else {
+								result = append(result, types.RespNil)
+							}
 						} else {
 							result = append(result, types.RespNil)
 						}
@@ -265,13 +285,22 @@ func buildSortResult(ctx *context.Context, entries []sortEntry, p *sortParams) t
 				}
 				list.PushBack([]byte(val))
 			}
+			list.RecomputeEncodingAuto()
+			oldObj, existed := ctx.Engine.Get(p.store)
 			ctx.Engine.Set(p.store, &object.Object{
 				Type:     object.TypeList,
 				Encoding: object.EncodingRaw,
 				Value:    list,
 			})
+			if existed && oldObj != nil {
+				ctx.Engine.NotifyKeyEvent(ctx.DB, uint32(keyevent.FlagOverwrite), "overwritten", p.store)
+				if oldObj.Type != object.TypeList {
+					ctx.Engine.NotifyKeyEvent(ctx.DB, uint32(keyevent.FlagTypeChanged), "type_changed", p.store)
+				}
+			}
+			ctx.Engine.NotifyKeyEvent(ctx.DB, uint32(keyevent.FlagList), "sortstore", p.store)
 		}
-		ctx.Engine.SignalKey(p.store)
+		ctx.SignalKey(p.store)
 		return types.NewInt(int64(len(result)))
 	}
 

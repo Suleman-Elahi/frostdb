@@ -4,6 +4,7 @@ import (
 	"strconv"
 	"strings"
 
+	"frostdb/internal/engine/keyevent"
 	"frostdb/internal/engine/object"
 	"frostdb/internal/kernel/context"
 	"frostdb/internal/resp/types"
@@ -178,11 +179,19 @@ func (c ZRangeStoreCommand) Execute(ctx *context.Context, args []types.Value) ty
 	for _, e := range entries {
 		resZSet.Add(e.Score, e.Member)
 	}
+	oldObj, existed := ctx.Engine.Get(dstKey)
 	ctx.Engine.Set(dstKey, &object.Object{
 		Type:     object.TypeZSet,
 		Encoding: object.EncodingRaw,
 		Value:    resZSet,
 	})
+	if existed && oldObj != nil {
+		ctx.Engine.NotifyKeyEvent(ctx.DB, uint32(keyevent.FlagOverwrite), "overwritten", dstKey)
+		if oldObj.Type != object.TypeZSet {
+			ctx.Engine.NotifyKeyEvent(ctx.DB, uint32(keyevent.FlagTypeChanged), "type_changed", dstKey)
+		}
+	}
+	ctx.SignalKey(dstKey)
 
 	return types.NewInt(int64(len(entries)))
 }
