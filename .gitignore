@@ -4,6 +4,7 @@ frostdb
 frostdb.exe
 frost.exe
 frostdb-test
+listune-server-*
 
 # Local files / Debug scripts
 scratch.go
